@@ -10,6 +10,7 @@ import org.junit.jupiter.api.TestFactory;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -55,6 +56,42 @@ class ConformanceTest {
                 String candidate = t.get("input").get("candidate_password").asText();
                 boolean expected = t.get("expected").get("result").asBoolean();
                 assertEquals(expected, PasswordHashing.verify(phcHash, candidate));
+            }));
+        }
+        return tests;
+    }
+
+    @TestFactory
+    List<DynamicTest> totpRfc6238Conformance() throws IOException {
+        JsonNode fixture = loadFixture("identity/mfa/totp-rfc6238.json");
+        List<DynamicTest> tests = new ArrayList<>();
+        for (JsonNode t : fixture.get("tests")) {
+            String id = t.get("id").asText();
+            String desc = t.get("description").asText();
+            tests.add(DynamicTest.dynamicTest("[" + id + "] " + desc, () -> {
+                JsonNode input = t.get("input");
+                byte[] secret = input.get("secret_ascii").asText().getBytes(StandardCharsets.US_ASCII);
+                long timestamp = input.get("timestamp").asLong();
+                int digits = input.get("digits").asInt();
+                String algorithm = input.get("algorithm").asText();
+                String expected = t.get("expected").get("result").asText();
+                assertEquals(expected, Totp.compute(secret, timestamp, Totp.DEFAULT_PERIOD, digits, algorithm));
+            }));
+        }
+        return tests;
+    }
+
+    @TestFactory
+    List<DynamicTest> recoveryCodeFormatConformance() throws IOException {
+        JsonNode fixture = loadFixture("identity/mfa/recovery-code-format.json");
+        List<DynamicTest> tests = new ArrayList<>();
+        for (JsonNode t : fixture.get("tests")) {
+            String id = t.get("id").asText();
+            String desc = t.get("description").asText();
+            tests.add(DynamicTest.dynamicTest("[" + id + "] " + desc, () -> {
+                String code = t.get("input").get("code").asText();
+                boolean expected = t.get("expected").get("result").asBoolean();
+                assertEquals(expected, RecoveryCodes.isValid(code));
             }));
         }
         return tests;
