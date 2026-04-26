@@ -588,4 +588,336 @@ public class InMemoryIdentityStore implements IdentityStore {
         if (oldHash != null) sessionByTokenHash.remove(oldHash);
         return updated;
     }
+
+    // ─── v0.2 MFA store operations (ADR 0008) ───
+
+    /** Pending TOTP/WebAuthn factor TTL per ADR 0008. */
+    public static final long PENDING_FACTOR_TTL_SECONDS = 600L;
+
+    private final java.util.Map<String, Factor> mfaFactors = new java.util.HashMap<>();
+    private final java.util.Map<String, byte[]> mfaTotpSecrets = new java.util.HashMap<>();
+    private final java.util.Map<String, byte[]> mfaWebauthnKeys = new java.util.HashMap<>();
+    private final java.util.Map<String, java.util.List<String>> mfaRecoveryHashes = new java.util.HashMap<>();
+    private final java.util.Map<String, boolean[]> mfaRecoveryConsumed = new java.util.HashMap<>();
+    /** Singleton index "{usrId}|{type}" → mfaId; covers TOTP + recovery. */
+    private final java.util.Map<String, String> mfaActiveSingleton = new java.util.HashMap<>();
+    private final java.util.Map<String, String> mfaWebauthnByCredentialId = new java.util.HashMap<>();
+    private final java.util.Map<String, UserMfaPolicy> mfaPolicies = new java.util.HashMap<>();
+
+    @Override
+    public TotpEnrollmentResult enrollTotpFactor(String usrId, String identifier) {
+        checkUserActive(usrId);
+        enforceNoActiveSingleton(usrId, "totp");
+        Instant now = now();
+        byte[] secret = Totp.generateSecret();
+        String mfaId = Id.generate("mfa");
+        TotpFactor factor = new TotpFactor(
+                mfaId, usrId, identifier,
+                FactorStatus.PENDING, null, now, now);
+        mfaFactors.put(mfaId, factor);
+        mfaTotpSecrets.put(mfaId, secret);
+        return new TotpEnrollmentResult(
+                factor,
+                base32Encode(secret).replaceAll("=+$", ""),
+                Totp.otpauthUri(secret, identifier, "Flametrench"));
+    }
+
+    @Override
+    public WebAuthnEnrollmentResult enrollWebAuthnFactor(
+            String usrId, String identifier,
+            byte[] publicKey, long signCount, String rpId) {
+        checkUserActive(usrId);
+        if (mfaWebauthnByCredentialId.containsKey(identifier)) {
+            throw new PreconditionError(
+                    "WebAuthn credential '" + identifier + "' is already enrolled",
+                    "duplicate_webauthn_credential");
+        }
+        Instant now = now();
+        String mfaId = Id.generate("mfa");
+        WebAuthnFactor factor = new WebAuthnFactor(
+                mfaId, usrId, identifier,
+                FactorStatus.PENDING, null,
+                rpId, signCount, now, now);
+        mfaFactors.put(mfaId, factor);
+        mfaWebauthnKeys.put(mfaId, publicKey);
+        mfaWebauthnByCredentialId.put(identifier, mfaId);
+        return new WebAuthnEnrollmentResult(factor);
+    }
+
+    @Override
+    public RecoveryEnrollmentResult enrollRecoveryFactor(String usrId) {
+        checkUserActive(usrId);
+        enforceNoActiveSingleton(usrId, "recovery");
+        Instant now = now();
+        String[] codes = RecoveryCodes.generateSet();
+        java.util.List<String> hashes = new java.util.ArrayList<>(codes.length);
+        for (String c : codes) hashes.add(PasswordHashing.hash(c));
+        boolean[] consumed = new boolean[codes.length];
+        String mfaId = Id.generate("mfa");
+        RecoveryFactor factor = new RecoveryFactor(
+                mfaId, usrId, FactorStatus.ACTIVE, null, now, now, codes.length);
+        mfaFactors.put(mfaId, factor);
+        mfaRecoveryHashes.put(mfaId, hashes);
+        mfaRecoveryConsumed.put(mfaId, consumed);
+        mfaActiveSingleton.put(usrId + "|recovery", mfaId);
+        return new RecoveryEnrollmentResult(factor, java.util.List.of(codes));
+    }
+
+    @Override
+    public Factor getMfaFactor(String mfaId) {
+        return requireFactor(mfaId);
+    }
+
+    @Override
+    public java.util.List<Factor> listMfaFactors(String usrId) {
+        java.util.List<Factor> out = new java.util.ArrayList<>();
+        for (Factor f : mfaFactors.values()) {
+            if (f.usrId().equals(usrId)) out.add(f);
+        }
+        return out;
+    }
+
+    @Override
+    public TotpFactor confirmTotpFactor(String mfaId, String code) {
+        Factor f = requireFactor(mfaId);
+        if (!(f instanceof TotpFactor totp)) {
+            throw new CredentialTypeMismatchError("Factor " + mfaId + " is not totp");
+        }
+        if (totp.status() != FactorStatus.PENDING) {
+            throw new PreconditionError(
+                    "Factor " + mfaId + " is " + totp.status().getValue() + "; only pending factors confirm",
+                    "factor_not_pending");
+        }
+        checkPendingNotExpired(totp);
+        byte[] secret = mfaTotpSecrets.get(mfaId);
+        if (!Totp.verify(secret, code, now().getEpochSecond(),
+                Totp.DEFAULT_PERIOD, Totp.DEFAULT_DIGITS, Totp.DEFAULT_ALGORITHM, 1)) {
+            throw new InvalidCredentialError("TOTP code did not verify");
+        }
+        Instant now = now();
+        TotpFactor active = new TotpFactor(
+                totp.id(), totp.usrId(), totp.identifier(),
+                FactorStatus.ACTIVE, totp.replaces(),
+                totp.createdAt(), now);
+        mfaFactors.put(mfaId, active);
+        mfaActiveSingleton.put(totp.usrId() + "|totp", mfaId);
+        return active;
+    }
+
+    @Override
+    public WebAuthnFactor confirmWebAuthnFactor(
+            String mfaId,
+            byte[] authenticatorData, byte[] clientDataJson, byte[] signature,
+            byte[] expectedChallenge, String expectedOrigin) {
+        Factor f = requireFactor(mfaId);
+        if (!(f instanceof WebAuthnFactor wa)) {
+            throw new CredentialTypeMismatchError("Factor " + mfaId + " is not webauthn");
+        }
+        if (wa.status() != FactorStatus.PENDING) {
+            throw new PreconditionError(
+                    "Factor " + mfaId + " is " + wa.status().getValue() + "; only pending factors confirm",
+                    "factor_not_pending");
+        }
+        checkPendingNotExpired(wa);
+        WebAuthnAssertionResult result = WebAuthn.verifyAssertion(
+                mfaWebauthnKeys.get(mfaId),
+                wa.signCount(),
+                wa.rpId(),
+                expectedChallenge,
+                expectedOrigin,
+                authenticatorData,
+                clientDataJson,
+                signature);
+        Instant now = now();
+        WebAuthnFactor active = new WebAuthnFactor(
+                wa.id(), wa.usrId(), wa.identifier(),
+                FactorStatus.ACTIVE, wa.replaces(),
+                wa.rpId(), result.newSignCount(),
+                wa.createdAt(), now);
+        mfaFactors.put(mfaId, active);
+        return active;
+    }
+
+    @Override
+    public Factor revokeMfaFactor(String mfaId) {
+        Factor f = requireFactor(mfaId);
+        if (f.status() == FactorStatus.REVOKED) return f;
+        Instant now = now();
+        Factor revoked;
+        if (f instanceof TotpFactor t) {
+            revoked = new TotpFactor(t.id(), t.usrId(), t.identifier(),
+                    FactorStatus.REVOKED, t.replaces(), t.createdAt(), now);
+            mfaActiveSingleton.remove(t.usrId() + "|totp");
+        } else if (f instanceof WebAuthnFactor w) {
+            revoked = new WebAuthnFactor(w.id(), w.usrId(), w.identifier(),
+                    FactorStatus.REVOKED, w.replaces(),
+                    w.rpId(), w.signCount(), w.createdAt(), now);
+            mfaWebauthnByCredentialId.remove(w.identifier());
+        } else if (f instanceof RecoveryFactor r) {
+            revoked = new RecoveryFactor(r.id(), r.usrId(),
+                    FactorStatus.REVOKED, r.replaces(),
+                    r.createdAt(), now, r.remaining());
+            mfaActiveSingleton.remove(r.usrId() + "|recovery");
+        } else {
+            throw new IllegalStateException("Unknown factor type");
+        }
+        mfaFactors.put(mfaId, revoked);
+        return revoked;
+    }
+
+    @Override
+    public MfaVerifyResult verifyMfa(String usrId, MfaProof proof) {
+        if (proof instanceof TotpProof t) return verifyTotp(usrId, t.code());
+        if (proof instanceof WebAuthnProof w) return verifyWebAuthnProof(usrId, w);
+        if (proof instanceof RecoveryProof r) return verifyRecovery(usrId, r.code());
+        throw new IllegalArgumentException("Unknown proof type");
+    }
+
+    private MfaVerifyResult verifyTotp(String usrId, String code) {
+        String mfaId = mfaActiveSingleton.get(usrId + "|totp");
+        if (mfaId == null) {
+            throw new InvalidCredentialError("No active TOTP factor for user");
+        }
+        byte[] secret = mfaTotpSecrets.get(mfaId);
+        if (!Totp.verify(secret, code, now().getEpochSecond(),
+                Totp.DEFAULT_PERIOD, Totp.DEFAULT_DIGITS, Totp.DEFAULT_ALGORITHM, 1)) {
+            throw new InvalidCredentialError("TOTP code did not verify");
+        }
+        return new MfaVerifyResult(mfaId, FactorType.TOTP, now(), null);
+    }
+
+    private MfaVerifyResult verifyWebAuthnProof(String usrId, WebAuthnProof proof) {
+        String mfaId = mfaWebauthnByCredentialId.get(proof.credentialId());
+        if (mfaId == null) {
+            throw new InvalidCredentialError("No WebAuthn factor for credential id");
+        }
+        Factor f = mfaFactors.get(mfaId);
+        if (!(f instanceof WebAuthnFactor wa)) {
+            throw new InvalidCredentialError("Factor is not WebAuthn");
+        }
+        if (!wa.usrId().equals(usrId)) {
+            throw new InvalidCredentialError("WebAuthn factor does not belong to user");
+        }
+        if (wa.status() != FactorStatus.ACTIVE) {
+            throw new InvalidCredentialError("WebAuthn factor is " + wa.status().getValue() + ", not active");
+        }
+        WebAuthnAssertionResult result = WebAuthn.verifyAssertion(
+                mfaWebauthnKeys.get(mfaId),
+                wa.signCount(), wa.rpId(),
+                proof.expectedChallenge(), proof.expectedOrigin(),
+                proof.authenticatorData(), proof.clientDataJson(), proof.signature());
+        Instant now = now();
+        mfaFactors.put(mfaId, new WebAuthnFactor(
+                wa.id(), wa.usrId(), wa.identifier(),
+                wa.status(), wa.replaces(),
+                wa.rpId(), result.newSignCount(),
+                wa.createdAt(), now));
+        return new MfaVerifyResult(mfaId, FactorType.WEBAUTHN, now, result.newSignCount());
+    }
+
+    private MfaVerifyResult verifyRecovery(String usrId, String code) {
+        String mfaId = mfaActiveSingleton.get(usrId + "|recovery");
+        if (mfaId == null) {
+            throw new InvalidCredentialError("No active recovery factor for user");
+        }
+        String normalized = RecoveryCodes.normalizeInput(code);
+        if (!RecoveryCodes.isValid(normalized)) {
+            throw new InvalidCredentialError("Recovery code is malformed");
+        }
+        java.util.List<String> hashes = mfaRecoveryHashes.get(mfaId);
+        boolean[] consumed = mfaRecoveryConsumed.get(mfaId);
+        // Walk every active slot regardless of an early match — keeps work
+        // constant relative to the active set so timing doesn't leak which
+        // slot matched.
+        int matchedSlot = -1;
+        for (int i = 0; i < hashes.size(); i++) {
+            if (consumed[i]) continue;
+            if (PasswordHashing.verify(hashes.get(i), normalized) && matchedSlot == -1) {
+                matchedSlot = i;
+            }
+        }
+        if (matchedSlot == -1) {
+            throw new InvalidCredentialError("Recovery code did not verify");
+        }
+        consumed[matchedSlot] = true;
+        Factor f = mfaFactors.get(mfaId);
+        if (f instanceof RecoveryFactor r) {
+            int remaining = 0;
+            for (boolean c : consumed) if (!c) remaining++;
+            mfaFactors.put(mfaId, new RecoveryFactor(
+                    r.id(), r.usrId(), r.status(), r.replaces(),
+                    r.createdAt(), now(), remaining));
+        }
+        return new MfaVerifyResult(mfaId, FactorType.RECOVERY, now(), null);
+    }
+
+    @Override
+    public UserMfaPolicy getMfaPolicy(String usrId) {
+        requireUser(usrId);
+        return mfaPolicies.get(usrId);
+    }
+
+    @Override
+    public UserMfaPolicy setMfaPolicy(String usrId, boolean required, Instant graceUntil) {
+        requireUser(usrId);
+        UserMfaPolicy policy = new UserMfaPolicy(usrId, required, graceUntil, now());
+        mfaPolicies.put(usrId, policy);
+        return policy;
+    }
+
+    // ─── private helpers ───
+
+    private Factor requireFactor(String mfaId) {
+        Factor f = mfaFactors.get(mfaId);
+        if (f == null) throw new NotFoundError("MFA factor " + mfaId + " not found");
+        return f;
+    }
+
+    private void checkUserActive(String usrId) {
+        User user = requireUser(usrId);
+        if (user.status() != Status.ACTIVE) {
+            throw new PreconditionError(
+                    "User " + usrId + " is " + user.status().getValue() + "; cannot enroll MFA",
+                    "user_not_active");
+        }
+    }
+
+    private void enforceNoActiveSingleton(String usrId, String type) {
+        if (mfaActiveSingleton.containsKey(usrId + "|" + type)) {
+            throw new PreconditionError(
+                    "User " + usrId + " already has an active " + type + " factor; "
+                            + "revoke before re-enrolling",
+                    "active_singleton_exists");
+        }
+    }
+
+    private void checkPendingNotExpired(Factor factor) {
+        if (factor.status() != FactorStatus.PENDING) return;
+        long ageSec = java.time.Duration.between(factor.createdAt(), now()).getSeconds();
+        if (ageSec > PENDING_FACTOR_TTL_SECONDS) {
+            throw new PreconditionError(
+                    "Pending factor " + factor.id() + " expired ("
+                            + ageSec + "s > " + PENDING_FACTOR_TTL_SECONDS + "s)",
+                    "pending_factor_expired");
+        }
+    }
+
+    /** Inline RFC 4648 base32 (matches Python SDK's otpauth URI). */
+    private static String base32Encode(byte[] buf) {
+        char[] alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".toCharArray();
+        int bits = 0, value = 0;
+        StringBuilder out = new StringBuilder();
+        for (byte b : buf) {
+            value = (value << 8) | (b & 0xFF);
+            bits += 8;
+            while (bits >= 5) {
+                out.append(alphabet[(value >>> (bits - 5)) & 0x1F]);
+                bits -= 5;
+            }
+        }
+        if (bits > 0) {
+            out.append(alphabet[(value << (5 - bits)) & 0x1F]);
+        }
+        return out.toString();
+    }
 }

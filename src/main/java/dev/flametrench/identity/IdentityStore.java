@@ -73,4 +73,39 @@ public interface IdentityStore {
     SessionWithToken refreshSession(String sesId);
 
     Session revokeSession(String sesId);
+
+    // ─── v0.2 MFA store operations (ADR 0008) ───
+
+    TotpEnrollmentResult enrollTotpFactor(String usrId, String identifier);
+
+    WebAuthnEnrollmentResult enrollWebAuthnFactor(
+            String usrId, String identifier,
+            byte[] publicKey, long signCount, String rpId);
+
+    RecoveryEnrollmentResult enrollRecoveryFactor(String usrId);
+
+    TotpFactor confirmTotpFactor(String mfaId, String code);
+
+    WebAuthnFactor confirmWebAuthnFactor(
+            String mfaId,
+            byte[] authenticatorData, byte[] clientDataJson, byte[] signature,
+            byte[] expectedChallenge, String expectedOrigin);
+
+    java.util.List<Factor> listMfaFactors(String usrId);
+
+    Factor getMfaFactor(String mfaId);
+
+    Factor revokeMfaFactor(String mfaId);
+
+    /**
+     * Verify an MFA proof. Throws InvalidCredentialError on mismatch.
+     * Does NOT mint a session; the spec's three-step flow is
+     * verifyPassword → verifyMfa → createSession.
+     */
+    MfaVerifyResult verifyMfa(String usrId, MfaProof proof);
+
+    /** Returns null when no policy row exists. */
+    UserMfaPolicy getMfaPolicy(String usrId);
+
+    UserMfaPolicy setMfaPolicy(String usrId, boolean required, java.time.Instant graceUntil);
 }
