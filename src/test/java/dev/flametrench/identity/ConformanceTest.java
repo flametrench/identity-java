@@ -12,7 +12,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
@@ -95,5 +98,77 @@ class ConformanceTest {
             }));
         }
         return tests;
+    }
+
+    @TestFactory
+    List<DynamicTest> webauthnAssertionConformance() throws IOException {
+        return webauthnFactory("identity/mfa/webauthn-assertion.json");
+    }
+
+    @TestFactory
+    List<DynamicTest> webauthnCounterConformance() throws IOException {
+        return webauthnFactory("identity/mfa/webauthn-counter-decrease-rejected.json");
+    }
+
+    private List<DynamicTest> webauthnFactory(String relativePath) throws IOException {
+        JsonNode fixture = loadFixture(relativePath);
+        JsonNode shared = fixture.has("shared") ? fixture.get("shared") : MAPPER.createObjectNode();
+        List<DynamicTest> tests = new ArrayList<>();
+        for (JsonNode t : fixture.get("tests")) {
+            String id = t.get("id").asText();
+            String desc = t.get("description").asText();
+            tests.add(DynamicTest.dynamicTest("[" + id + "] " + desc, () -> {
+                Map<String, Object> actual = runWebauthnFixture(shared, t.get("input"));
+                Map<String, Object> expected = jsonObjectToMap(t.get("expected").get("result"));
+                assertEquals(expected, actual);
+            }));
+        }
+        return tests;
+    }
+
+    private static Map<String, Object> runWebauthnFixture(JsonNode shared, JsonNode input) {
+        // Merge shared + input.
+        Map<String, JsonNode> merged = new LinkedHashMap<>();
+        shared.fields().forEachRemaining(e -> merged.put(e.getKey(), e.getValue()));
+        input.fields().forEachRemaining(e -> merged.put(e.getKey(), e.getValue()));
+        HexFormat hex = HexFormat.of();
+        try {
+            WebAuthnAssertionResult result = WebAuthn.verifyAssertion(
+                    hex.parseHex(merged.get("cose_public_key_hex").asText()),
+                    merged.get("stored_sign_count").asLong(),
+                    merged.get("stored_rp_id").asText(),
+                    hex.parseHex(merged.get("expected_challenge_hex").asText()),
+                    merged.get("expected_origin").asText(),
+                    hex.parseHex(merged.get("authenticator_data_hex").asText()),
+                    hex.parseHex(merged.get("client_data_json_hex").asText()),
+                    hex.parseHex(merged.get("signature_hex").asText()),
+                    !merged.containsKey("require_user_verified") || merged.get("require_user_verified").asBoolean(),
+                    !merged.containsKey("require_user_present") || merged.get("require_user_present").asBoolean()
+            );
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("ok", true);
+            out.put("new_sign_count", (int) result.newSignCount());
+            return out;
+        } catch (WebAuthnError exc) {
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("ok", false);
+            out.put("reason", exc.getReason());
+            return out;
+        }
+    }
+
+    private static Map<String, Object> jsonObjectToMap(JsonNode obj) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        obj.fields().forEachRemaining(e -> {
+            JsonNode v = e.getValue();
+            if (v.isBoolean()) {
+                out.put(e.getKey(), v.asBoolean());
+            } else if (v.isInt() || v.isLong()) {
+                out.put(e.getKey(), v.asInt());
+            } else {
+                out.put(e.getKey(), v.asText());
+            }
+        });
+        return out;
     }
 }

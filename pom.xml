@@ -60,17 +60,21 @@
             <version>${argon2.version}</version>
         </dependency>
 
+        <!-- Jackson for clientDataJSON parsing in WebAuthn (v0.2). The
+             WebAuthn spec permits forward-compatible additional fields
+             on clientDataJSON, so a real JSON parser is the right call;
+             a hand-rolled splitter would silently break on extensions. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+
         <!-- Test dependencies -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
             <version>${junit.version}</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>com.fasterxml.jackson.core</groupId>
-            <artifactId>jackson-databind</artifactId>
-            <version>${jackson.version}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
