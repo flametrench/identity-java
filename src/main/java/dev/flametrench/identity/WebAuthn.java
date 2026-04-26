@@ -9,6 +9,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.HexFormat;
 import java.security.AlgorithmParameters;
 import java.security.GeneralSecurityException;
 import java.security.KeyFactory;
@@ -35,6 +36,9 @@ public final class WebAuthn {
 
     private static final int FLAG_UP = 0x01;
     private static final int FLAG_UV = 0x04;
+
+    /** Minimum RSA modulus per ADR 0010 / WebAuthn §5.8.5. */
+    private static final int RSA_MIN_KEY_SIZE_BITS = 2048;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final ECParameterSpec P256_PARAMS = loadP256Params();
@@ -138,13 +142,8 @@ public final class WebAuthn {
             );
         }
 
-        // Parse COSE_Key, build PublicKey, verify ES256 signature.
-        Es256Coords coords = parseCoseEs256(cosePublicKey);
-        PublicKey publicKey = buildEs256PublicKey(coords);
-
-        if (signature.length < 8 || (signature[0] & 0xFF) != 0x30) {
-            throw new WebAuthnError("Signature is not a DER ECDSA structure", "signature_invalid");
-        }
+        // Algorithm dispatch per ADR 0010: COSE_Key.alg picks the verifier.
+        ParsedCose cose = parseCoseKey(cosePublicKey);
 
         byte[] clientHash;
         byte[] signed;
@@ -159,13 +158,40 @@ public final class WebAuthn {
 
         boolean ok;
         try {
-            Signature verifier = Signature.getInstance("SHA256withECDSA");
-            verifier.initVerify(publicKey);
-            verifier.update(signed);
-            ok = verifier.verify(signature);
+            long alg = cose.alg();
+            if (alg == -7L) {
+                if (signature.length < 8 || (signature[0] & 0xFF) != 0x30) {
+                    throw new WebAuthnError("Signature is not a DER ECDSA structure", "signature_invalid");
+                }
+                PublicKey publicKey = buildEs256PublicKey((Es256Coords) cose);
+                Signature verifier = Signature.getInstance("SHA256withECDSA");
+                verifier.initVerify(publicKey);
+                verifier.update(signed);
+                ok = verifier.verify(signature);
+            } else if (alg == -257L) {
+                PublicKey publicKey = buildRs256PublicKey((Rs256Coords) cose);
+                Signature verifier = Signature.getInstance("SHA256withRSA");
+                verifier.initVerify(publicKey);
+                verifier.update(signed);
+                ok = verifier.verify(signature);
+            } else if (alg == -8L) {
+                if (signature.length != 64) {
+                    throw new WebAuthnError(
+                            "Ed25519 signature must be 64 bytes, got " + signature.length,
+                            "signature_invalid"
+                    );
+                }
+                PublicKey publicKey = buildEd25519PublicKey((EddsaCoords) cose);
+                Signature verifier = Signature.getInstance("Ed25519");
+                verifier.initVerify(publicKey);
+                verifier.update(signed);
+                ok = verifier.verify(signature);
+            } else {
+                throw new WebAuthnError("Unsupported alg dispatch: " + alg, "unsupported_key");
+            }
+        } catch (WebAuthnError e) {
+            throw e;
         } catch (GeneralSecurityException exc) {
-            // SignatureException is thrown for malformed DER too; treat
-            // identically to a verify-returns-false case.
             throw new WebAuthnError(
                     "Signature verification failed: " + exc.getMessage(),
                     "signature_invalid"
@@ -231,9 +257,21 @@ public final class WebAuthn {
 
     // ─── internals ─────────────────────────────────────────────
 
-    private record Es256Coords(byte[] x, byte[] y) {}
+    /** Discriminated COSE_Key parse result; alg picks the verifier. */
+    private sealed interface ParsedCose {
+        long alg();
+    }
+    private record Es256Coords(byte[] x, byte[] y) implements ParsedCose {
+        public long alg() { return -7L; }
+    }
+    private record Rs256Coords(byte[] n, byte[] e) implements ParsedCose {
+        public long alg() { return -257L; }
+    }
+    private record EddsaCoords(byte[] x) implements ParsedCose {
+        public long alg() { return -8L; }
+    }
 
-    private static Es256Coords parseCoseEs256(byte[] coseKey) {
+    private static ParsedCose parseCoseKey(byte[] coseKey) {
         CborCursor c = new CborCursor(coseKey);
         Object value = decodeItem(c);
         if (c.offset != coseKey.length) {
@@ -242,28 +280,73 @@ public final class WebAuthn {
         if (!(value instanceof Map<?, ?> map)) {
             throw new WebAuthnError("Top-level COSE value is not a map", "malformed");
         }
-        // CBOR int values come out as Long; look up with Long keys.
         Object kty = map.get(1L);
         Object alg = map.get(3L);
-        Object crv = map.get(-1L);
-        Object x = map.get(-2L);
-        Object y = map.get(-3L);
-        if (!(kty instanceof Long ktyL) || ktyL != 2L) {
-            throw new WebAuthnError("Unsupported COSE kty: " + kty, "unsupported_key");
+        if (!(alg instanceof Long algL)) {
+            throw new WebAuthnError("Missing or non-int COSE alg: " + alg, "unsupported_key");
         }
-        if (!(alg instanceof Long algL) || algL != -7L) {
-            throw new WebAuthnError("Unsupported COSE alg: " + alg, "unsupported_key");
+        if (algL == -7L) {
+            if (!(kty instanceof Long ktyL) || ktyL != 2L) {
+                throw new WebAuthnError("ES256 requires COSE kty=2, got " + kty, "unsupported_key");
+            }
+            Object crv = map.get(-1L);
+            Object x = map.get(-2L);
+            Object y = map.get(-3L);
+            if (!(crv instanceof Long crvL) || crvL != 1L) {
+                throw new WebAuthnError("ES256 requires crv=1, got " + crv, "unsupported_key");
+            }
+            if (!(x instanceof byte[] xb) || xb.length != 32) {
+                throw new WebAuthnError("COSE x coordinate must be 32 bytes", "malformed");
+            }
+            if (!(y instanceof byte[] yb) || yb.length != 32) {
+                throw new WebAuthnError("COSE y coordinate must be 32 bytes", "malformed");
+            }
+            return new Es256Coords(xb, yb);
         }
-        if (!(crv instanceof Long crvL) || crvL != 1L) {
-            throw new WebAuthnError("Unsupported COSE crv: " + crv, "unsupported_key");
+        if (algL == -257L) {
+            if (!(kty instanceof Long ktyL) || ktyL != 3L) {
+                throw new WebAuthnError("RS256 requires COSE kty=3, got " + kty, "unsupported_key");
+            }
+            Object n = map.get(-1L);
+            Object e = map.get(-2L);
+            if (!(n instanceof byte[] nb)) {
+                throw new WebAuthnError("COSE RSA modulus (n) must be a byte string", "malformed");
+            }
+            if (!(e instanceof byte[] eb)) {
+                throw new WebAuthnError("COSE RSA exponent (e) must be a byte string", "malformed");
+            }
+            // BigInteger(1, ...) treats the bytes as unsigned; bitLength is
+            // the modulus bit-length without leading zeroes.
+            int bits = new java.math.BigInteger(1, nb).bitLength();
+            if (bits < RSA_MIN_KEY_SIZE_BITS) {
+                throw new WebAuthnError(
+                        "RSA key " + bits + "-bit is below the " + RSA_MIN_KEY_SIZE_BITS + "-bit floor",
+                        "unsupported_key"
+                );
+            }
+            return new Rs256Coords(nb, eb);
         }
-        if (!(x instanceof byte[] xb) || xb.length != 32) {
-            throw new WebAuthnError("COSE x coordinate must be 32 bytes", "malformed");
+        if (algL == -8L) {
+            if (!(kty instanceof Long ktyL) || ktyL != 1L) {
+                throw new WebAuthnError("EdDSA requires COSE kty=1, got " + kty, "unsupported_key");
+            }
+            Object crv = map.get(-1L);
+            Object x = map.get(-2L);
+            if (!(crv instanceof Long crvL) || crvL != 6L) {
+                throw new WebAuthnError(
+                        "v0.2 EdDSA accepts only Ed25519 (crv=6), got crv=" + crv,
+                        "unsupported_key"
+                );
+            }
+            if (!(x instanceof byte[] xb) || xb.length != 32) {
+                throw new WebAuthnError("Ed25519 public key must be 32 bytes", "malformed");
+            }
+            return new EddsaCoords(xb);
         }
-        if (!(y instanceof byte[] yb) || yb.length != 32) {
-            throw new WebAuthnError("COSE y coordinate must be 32 bytes", "malformed");
-        }
-        return new Es256Coords(xb, yb);
+        throw new WebAuthnError(
+                "Unsupported COSE alg: " + algL + " (kty=" + kty + ")",
+                "unsupported_key"
+        );
     }
 
     private static final class CborCursor {
@@ -352,6 +435,40 @@ public final class WebAuthn {
         } catch (GeneralSecurityException exc) {
             throw new WebAuthnError(
                     "Could not construct P-256 public key: " + exc.getMessage(),
+                    "malformed"
+            );
+        }
+    }
+
+    private static PublicKey buildRs256PublicKey(Rs256Coords coords) {
+        try {
+            BigInteger n = new BigInteger(1, coords.n());
+            BigInteger e = new BigInteger(1, coords.e());
+            return KeyFactory.getInstance("RSA")
+                    .generatePublic(new java.security.spec.RSAPublicKeySpec(n, e));
+        } catch (GeneralSecurityException exc) {
+            throw new WebAuthnError(
+                    "Could not construct RSA public key: " + exc.getMessage(),
+                    "malformed"
+            );
+        }
+    }
+
+    private static PublicKey buildEd25519PublicKey(EddsaCoords coords) {
+        try {
+            // Build SubjectPublicKeyInfo DER per RFC 8410 §4 and feed to
+            // X509EncodedKeySpec. The fixed 12-byte prefix encodes the
+            // SEQUENCE wrapper, the AlgorithmIdentifier (OID 1.3.101.112
+            // = id-Ed25519), and the BIT STRING tag/length/unused-bits.
+            byte[] prefix = HexFormat.of().parseHex("302a300506032b6570032100");
+            byte[] spki = new byte[prefix.length + 32];
+            System.arraycopy(prefix, 0, spki, 0, prefix.length);
+            System.arraycopy(coords.x(), 0, spki, prefix.length, 32);
+            return KeyFactory.getInstance("Ed25519")
+                    .generatePublic(new java.security.spec.X509EncodedKeySpec(spki));
+        } catch (GeneralSecurityException exc) {
+            throw new WebAuthnError(
+                    "Could not construct Ed25519 public key: " + exc.getMessage(),
                     "malformed"
             );
         }

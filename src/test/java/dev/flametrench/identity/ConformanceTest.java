@@ -110,6 +110,11 @@ class ConformanceTest {
         return webauthnFactory("identity/mfa/webauthn-counter-decrease-rejected.json");
     }
 
+    @TestFactory
+    List<DynamicTest> webauthnAlgorithmsConformance() throws IOException {
+        return webauthnFactory("identity/mfa/webauthn-assertion-algorithms.json");
+    }
+
     private List<DynamicTest> webauthnFactory(String relativePath) throws IOException {
         JsonNode fixture = loadFixture(relativePath);
         JsonNode shared = fixture.has("shared") ? fixture.get("shared") : MAPPER.createObjectNode();
