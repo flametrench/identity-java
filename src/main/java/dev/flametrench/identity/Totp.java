@@ -85,6 +85,15 @@ public final class Totp {
             String algorithm,
             int driftWindows
     ) {
+        if (driftWindows < 0 || driftWindows > 10) {
+            // Cap the verifier search radius. Each window adds one HMAC
+            // computation, so unbounded values amount to a CPU-exhaustion
+            // primitive. The default ±1 covers normal clock skew; ±10 is
+            // the operational ceiling.
+            throw new IllegalArgumentException(
+                    "driftWindows must be 0..10, got " + driftWindows
+            );
+        }
         if (candidate == null || candidate.length() != digits) return false;
         for (int i = 0; i < candidate.length(); i++) {
             char c = candidate.charAt(i);

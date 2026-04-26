@@ -31,6 +31,15 @@ public final class PasswordHashing {
     /** Spec floor: 1 thread. */
     public static final int PARALLELISM = 1;
 
+    /**
+     * Hard cap on plaintext password length before Argon2id. Most
+     * password managers cap user-input passwords at 256 bytes;
+     * legitimate passphrases never need 1024. Without a cap, a caller
+     * can pass a multi-megabyte string and burn the Argon2id memory
+     * cost (m=19 MiB) repeatedly.
+     */
+    public static final int MAX_PASSWORD_BYTES = 1024;
+
     private static final Argon2 ARGON2 = Argon2Factory.create(Argon2Factory.Argon2Types.ARGON2id);
 
     private PasswordHashing() {
@@ -41,13 +50,15 @@ public final class PasswordHashing {
      * Verify a candidate plaintext password against a PHC-encoded
      * Argon2id hash. Returns false on any verification failure (wrong
      * password, malformed hash, unsupported variant) — never throws on
-     * bad input. The contract is "did this plaintext produce that hash?",
-     * and the answer to a malformed hash is "no".
+     * bad input EXCEPT plaintext over {@link #MAX_PASSWORD_BYTES}, which
+     * raises {@link IllegalArgumentException} as a caller-side
+     * input-validation failure.
      */
     public static boolean verify(String phcHash, String candidatePassword) {
         if (phcHash == null || candidatePassword == null) {
             return false;
         }
+        checkPasswordLength(candidatePassword);
         try {
             return ARGON2.verify(phcHash, candidatePassword.getBytes(java.nio.charset.StandardCharsets.UTF_8));
         } catch (RuntimeException e) {
@@ -58,10 +69,22 @@ public final class PasswordHashing {
     /**
      * Hash a plaintext password with Argon2id at the spec floor. The
      * returned string is PHC-encoded and verifies against
-     * {@link #verify(String, String)} on any conforming SDK.
+     * {@link #verify(String, String)} on any conforming SDK. Plaintext
+     * over {@link #MAX_PASSWORD_BYTES} raises IllegalArgumentException.
      */
     public static String hash(String plaintext) {
+        checkPasswordLength(plaintext);
         // argon2-jvm's hash signature is (iterations, memory, parallelism, password).
         return ARGON2.hash(TIME_COST, MEMORY_COST, PARALLELISM, plaintext.toCharArray());
+    }
+
+    private static void checkPasswordLength(String plaintext) {
+        int byteLength = plaintext.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        if (byteLength > MAX_PASSWORD_BYTES) {
+            throw new IllegalArgumentException(
+                    "password exceeds " + MAX_PASSWORD_BYTES
+                            + "-byte cap (got " + byteLength + " bytes)"
+            );
+        }
     }
 }
