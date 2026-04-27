@@ -7,7 +7,7 @@
 
     <groupId>dev.flametrench</groupId>
     <artifactId>identity</artifactId>
-    <version>0.2.0-rc.3</version>
+    <version>0.2.0-rc.4</version>
     <packaging>jar</packaging>
 
     <name>flametrench-identity</name>
@@ -70,11 +70,26 @@
             <version>${jackson.version}</version>
         </dependency>
 
+        <!-- Optional: only needed by PostgresIdentityStore. Adopters
+             wire their own DataSource. -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>42.7.4</version>
+            <optional>true</optional>
+        </dependency>
+
         <!-- Test dependencies -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
             <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>42.7.4</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
