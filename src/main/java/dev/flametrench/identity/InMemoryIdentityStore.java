@@ -438,7 +438,15 @@ public class InMemoryIdentityStore implements IdentityStore {
         if (phc == null || !PasswordHashing.verify(phc, password)) {
             throw new InvalidCredentialError();
         }
-        return new VerifiedCredential(cred.usrId(), cred.id());
+        // ADR 0008: surface usr_mfa_policy state.
+        UserMfaPolicy policy = mfaPolicies.get(cred.usrId());
+        boolean mfaRequired = false;
+        if (policy != null && policy.required()) {
+            if (policy.graceUntil() == null || !policy.graceUntil().isAfter(now())) {
+                mfaRequired = true;
+            }
+        }
+        return new VerifiedCredential(cred.usrId(), cred.id(), mfaRequired);
     }
 
     // ─── Sessions ───

@@ -109,6 +109,44 @@ class InMemoryIdentityStoreTest {
                 () -> store.verifyPassword("alice@example.com", "v1"));
     }
 
+    // ─── ADR 0008: usr_mfa_policy gate on verifyPassword ───
+
+    @Test
+    void verifyPassword_mfaRequiredFalseWhenNoPolicy() {
+        User u = store.createUser();
+        store.createPasswordCredential(u.id(), "a@x", "pw");
+        VerifiedCredential v = store.verifyPassword("a@x", "pw");
+        org.junit.jupiter.api.Assertions.assertFalse(v.mfaRequired());
+    }
+
+    @Test
+    void verifyPassword_mfaRequiredTrueWhenPolicyActiveAndNoGrace() {
+        User u = store.createUser();
+        store.createPasswordCredential(u.id(), "a@x", "pw");
+        store.setMfaPolicy(u.id(), true, null);
+        VerifiedCredential v = store.verifyPassword("a@x", "pw");
+        org.junit.jupiter.api.Assertions.assertTrue(v.mfaRequired());
+    }
+
+    @Test
+    void verifyPassword_mfaRequiredFalseDuringGraceWindow() {
+        User u = store.createUser();
+        store.createPasswordCredential(u.id(), "a@x", "pw");
+        java.time.Instant future = java.time.Instant.now().plus(java.time.Duration.ofDays(7));
+        store.setMfaPolicy(u.id(), true, future);
+        VerifiedCredential v = store.verifyPassword("a@x", "pw");
+        org.junit.jupiter.api.Assertions.assertFalse(v.mfaRequired());
+    }
+
+    @Test
+    void verifyPassword_mfaRequiredFalseWhenRequiredFalse() {
+        User u = store.createUser();
+        store.createPasswordCredential(u.id(), "a@x", "pw");
+        store.setMfaPolicy(u.id(), false, null);
+        VerifiedCredential v = store.verifyPassword("a@x", "pw");
+        org.junit.jupiter.api.Assertions.assertFalse(v.mfaRequired());
+    }
+
     // ─── Sessions ───
 
     @Test

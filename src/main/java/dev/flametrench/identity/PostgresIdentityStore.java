@@ -797,9 +797,28 @@ public class PostgresIdentityStore implements IdentityStore {
                 if (hash == null || !PasswordHashing.verify(hash, password)) {
                     throw new InvalidCredentialError("Invalid credential");
                 }
+                String usrUuid = rs.getString("usr_id");
+                String credUuid = rs.getString("id");
+                // ADR 0008: surface usr_mfa_policy state. Apps MUST gate
+                // createSession on mfaRequired by calling verifyMfa first
+                // when true.
+                boolean mfaRequired = false;
+                try (PreparedStatement polPs = conn.prepareStatement(
+                        "SELECT required, grace_until FROM usr_mfa_policy WHERE usr_id = ?")) {
+                    polPs.setObject(1, java.util.UUID.fromString(usrUuid));
+                    try (ResultSet polRs = polPs.executeQuery()) {
+                        if (polRs.next() && polRs.getBoolean("required")) {
+                            java.sql.Timestamp grace = polRs.getTimestamp("grace_until");
+                            if (grace == null || !grace.toInstant().isAfter(clock.instant())) {
+                                mfaRequired = true;
+                            }
+                        }
+                    }
+                }
                 return new VerifiedCredential(
-                        Id.encode("usr", rs.getString("usr_id")),
-                        Id.encode("cred", rs.getString("id"))
+                        Id.encode("usr", usrUuid),
+                        Id.encode("cred", credUuid),
+                        mfaRequired
                 );
             }
         } catch (SQLException e) {
