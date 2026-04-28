@@ -1,6 +1,8 @@
 # flametrench-identity (Java)
 
-Java SDK for the [Flametrench v0.1](https://github.com/flametrench/spec) identity specification: users, credentials (Argon2id-pinned passwords, passkeys, OIDC), and user-bound sessions with rotation on refresh.
+Java SDK for the [Flametrench](https://github.com/flametrench/spec) identity specification: users, credentials (Argon2id-pinned passwords, passkeys, OIDC), user-bound sessions with rotation on refresh, and v0.2 multi-factor authentication ([ADR 0008](https://github.com/flametrench/spec/blob/main/decisions/0008-mfa.md), [ADR 0010](https://github.com/flametrench/spec/blob/main/decisions/0010-webauthn-rs256-eddsa.md)) — TOTP (RFC 6238), recovery codes, and WebAuthn assertion verification across ES256 / RS256 / EdDSA.
+
+**Status:** v0.2.0-rc.4 (release candidate). Includes the production-ready `PostgresIdentityStore` alongside the in-memory reference store.
 
 The same fixture corpus that gates `@flametrench/identity` (Node), `flametrench/identity` (PHP), and `flametrench-identity` (Python) runs here. The cross-language Argon2id parity test is mechanical interop verification — a PHC hash produced by any of the four SDKs verifies identically here.
 
@@ -51,7 +53,7 @@ Maven:
 <dependency>
     <groupId>dev.flametrench</groupId>
     <artifactId>identity</artifactId>
-    <version>0.1.0</version>
+    <version>0.2.0-rc.4</version>
 </dependency>
 ```
 
