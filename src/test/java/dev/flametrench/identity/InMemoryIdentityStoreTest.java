@@ -54,6 +54,69 @@ class InMemoryIdentityStoreTest {
         assertThrows(AlreadyTerminalError.class, () -> store.revokeUser(u.id()));
     }
 
+    // ─── listUsers (ADR 0015) ───
+
+    @Test
+    void listUsersReturnsAllInIdAscOrder() {
+        User a = store.createUser();
+        User b = store.createUser();
+        User c = store.createUser();
+        Page<User> page = store.listUsers(null, 50, null, null);
+        assertEquals(java.util.List.of(a.id(), b.id(), c.id()),
+                page.data().stream().map(User::id).toList());
+        assertNull(page.nextCursor());
+    }
+
+    @Test
+    void listUsersStatusFilterExcludesOthers() {
+        User active = store.createUser();
+        User suspended = store.createUser();
+        store.suspendUser(suspended.id());
+        Page<User> page = store.listUsers(null, 50, null, Status.ACTIVE);
+        assertEquals(java.util.List.of(active.id()),
+                page.data().stream().map(User::id).toList());
+    }
+
+    @Test
+    void listUsersQueryCaseInsensitiveSubstring() {
+        User alice = store.createUser();
+        store.createPasswordCredential(alice.id(), "alice@example.com", "long-enough-password");
+        User bob = store.createUser();
+        store.createPasswordCredential(bob.id(), "bob@example.com", "long-enough-password");
+        User carol = store.createUser();
+        store.createPasswordCredential(carol.id(), "carol@other.test", "long-enough-password");
+        Page<User> page = store.listUsers(null, 50, "EXAMPLE", null);
+        assertEquals(java.util.Set.of(alice.id(), bob.id()),
+                page.data().stream().map(User::id).collect(java.util.stream.Collectors.toSet()));
+    }
+
+    @Test
+    void listUsersCursorWalksPages() {
+        java.util.List<String> ids = new java.util.ArrayList<>();
+        for (int i = 0; i < 5; i++) ids.add(store.createUser().id());
+        Page<User> page1 = store.listUsers(null, 2, null, null);
+        assertEquals(java.util.List.of(ids.get(0), ids.get(1)),
+                page1.data().stream().map(User::id).toList());
+        Page<User> page2 = store.listUsers(page1.nextCursor(), 2, null, null);
+        assertEquals(java.util.List.of(ids.get(2), ids.get(3)),
+                page2.data().stream().map(User::id).toList());
+        Page<User> page3 = store.listUsers(page2.nextCursor(), 2, null, null);
+        assertEquals(java.util.List.of(ids.get(4)),
+                page3.data().stream().map(User::id).toList());
+        assertNull(page3.nextCursor());
+    }
+
+    @Test
+    void listUsersReturnsDisplayName() {
+        User alice = store.createUser("Alice");
+        User bob = store.createUser();
+        Page<User> page = store.listUsers(null, 50, null, null);
+        java.util.Map<String, String> byId = new java.util.HashMap<>();
+        for (User u : page.data()) byId.put(u.id(), u.displayName());
+        assertEquals("Alice", byId.get(alice.id()));
+        assertNull(byId.get(bob.id()));
+    }
+
     // ─── display_name (ADR 0014) ───
 
     @Test

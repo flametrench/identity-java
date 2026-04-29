@@ -180,6 +180,40 @@ public class InMemoryIdentityStore implements IdentityStore {
     }
 
     @Override
+    public Page<User> listUsers(String cursor, int limit, String query, Status status) {
+        int cappedLimit = Math.max(1, Math.min(limit, 200));
+        String needle = query != null ? query.toLowerCase(java.util.Locale.ROOT) : null;
+        java.util.List<User> matching = new java.util.ArrayList<>();
+        for (User u : users.values()) {
+            if (status != null && u.status() != status) continue;
+            if (needle != null) {
+                boolean hit = false;
+                for (Credential c : credentials.values()) {
+                    if (!c.usrId().equals(u.id())) continue;
+                    if (c.status() != Status.ACTIVE) continue;
+                    if (c.identifier().toLowerCase(java.util.Locale.ROOT).contains(needle)) {
+                        hit = true;
+                        break;
+                    }
+                }
+                if (!hit) continue;
+            }
+            matching.add(u);
+        }
+        matching.sort(java.util.Comparator.comparing(User::id));
+        int start = 0;
+        if (cursor != null) {
+            while (start < matching.size() && matching.get(start).id().compareTo(cursor) <= 0) start++;
+        }
+        int end = Math.min(start + cappedLimit, matching.size());
+        java.util.List<User> page = matching.subList(start, end);
+        String nextCursor = (start + cappedLimit < matching.size() && !page.isEmpty())
+                ? page.get(page.size() - 1).id()
+                : null;
+        return new Page<>(java.util.List.copyOf(page), nextCursor);
+    }
+
+    @Override
     public User suspendUser(String usrId) {
         User u = requireUser(usrId);
         if (u.status() == Status.REVOKED) {

@@ -44,6 +44,17 @@ public interface IdentityStore {
      * {@link NotFoundError}.
      */
     User updateUser(String usrId, String displayName);
+    /**
+     * ADR 0015 — paginated user enumeration. Adopters MUST gate the call
+     * site (sysadmin route or equivalent); the SDK does not enforce
+     * authorization. Cursor and ordering match listMembers.
+     *
+     * @param cursor opaque cursor; null for the first page
+     * @param limit  page size; clamped to [1, 200]
+     * @param query  case-insensitive substring against active credential identifiers; null for no filter
+     * @param status user-status filter; null for all
+     */
+    Page<User> listUsers(String cursor, int limit, String query, Status status);
     User suspendUser(String usrId);
     User reinstateUser(String usrId);
     User revokeUser(String usrId);

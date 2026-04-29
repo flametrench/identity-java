@@ -334,6 +334,55 @@ public class PostgresIdentityStore implements IdentityStore {
     }
 
     @Override
+    public Page<User> listUsers(String cursor, int limit, String query, Status status) {
+        int cappedLimit = Math.max(1, Math.min(limit, 200));
+        StringBuilder sql = new StringBuilder(
+                "SELECT id, status, display_name, created_at, updated_at FROM usr WHERE 1=1");
+        java.util.List<Object> params = new java.util.ArrayList<>();
+        if (cursor != null) {
+            sql.append(" AND id > ?");
+            params.add(wireToUuid(cursor));
+        }
+        if (status != null) {
+            sql.append(" AND status = ?");
+            params.add(status.getValue());
+        }
+        if (query != null) {
+            sql.append(" AND EXISTS ("
+                    + " SELECT 1 FROM cred"
+                    + " WHERE cred.usr_id = usr.id"
+                    + " AND cred.status = 'active'"
+                    + " AND cred.identifier ILIKE ?"
+                    + ")");
+            String escaped = query.replace("\\", "\\\\")
+                    .replace("%", "\\%")
+                    .replace("_", "\\_");
+            params.add("%" + escaped + "%");
+        }
+        sql.append(" ORDER BY id LIMIT ?");
+        params.add(cappedLimit + 1);
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql.toString())) {
+            for (int i = 0; i < params.size(); i++) {
+                ps.setObject(i + 1, params.get(i));
+            }
+            try (ResultSet rs = ps.executeQuery()) {
+                java.util.List<User> rows = new java.util.ArrayList<>();
+                while (rs.next()) rows.add(rowToUser(rs));
+                java.util.List<User> page = rows.size() > cappedLimit
+                        ? rows.subList(0, cappedLimit)
+                        : rows;
+                String nextCursor = rows.size() > cappedLimit && !page.isEmpty()
+                        ? page.get(page.size() - 1).id()
+                        : null;
+                return new Page<>(java.util.List.copyOf(page), nextCursor);
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    @Override
     public User suspendUser(String usrId) {
         return tx(conn -> {
             UUID uuid = wireToUuid(usrId);
