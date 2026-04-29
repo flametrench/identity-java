@@ -8,12 +8,15 @@ import dev.flametrench.ids.Id;
 import javax.sql.DataSource;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.security.SecureRandom;
 import java.sql.Array;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Savepoint;
 import java.sql.Timestamp;
 import java.sql.Types;
 import java.time.Clock;
@@ -65,6 +68,7 @@ public class PostgresIdentityStore implements IdentityStore {
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
 
     private final DataSource dataSource;
+    private final Connection callerConnection;
     private final Clock clock;
 
     public PostgresIdentityStore(DataSource dataSource) {
@@ -73,6 +77,30 @@ public class PostgresIdentityStore implements IdentityStore {
 
     public PostgresIdentityStore(DataSource dataSource, Clock clock) {
         this.dataSource = dataSource;
+        this.callerConnection = null;
+        this.clock = clock;
+    }
+
+    /**
+     * ADR 0013 caller-owned-connection constructor. The adopter has
+     * already acquired a Connection (typically via {@code
+     * DataSource.getConnection()}, set autoCommit=false, and run BEGIN
+     * either implicitly or explicitly). The store cooperates by using
+     * {@code SAVEPOINT} for its internal atomicity boundaries instead of
+     * opening its own transaction. Adopters wrapping multiple SDK calls
+     * in one outer transaction MUST construct every participating store
+     * with the same Connection.
+     *
+     * <p>The store does NOT close the Connection — the adopter owns its
+     * lifecycle.
+     */
+    public PostgresIdentityStore(Connection callerConnection) {
+        this(callerConnection, Clock.systemUTC());
+    }
+
+    public PostgresIdentityStore(Connection callerConnection, Clock clock) {
+        this.dataSource = null;
+        this.callerConnection = callerConnection;
         this.clock = clock;
     }
 
@@ -115,8 +143,104 @@ public class PostgresIdentityStore implements IdentityStore {
         T apply(Connection conn) throws SQLException;
     }
 
+    /** True when the store was constructed with a caller-owned Connection. */
+    private boolean isCallerOwned() {
+        return callerConnection != null;
+    }
+
+    /**
+     * Return a Connection routed to the right place. Standalone
+     * (DataSource): fresh connection from the pool, with normal
+     * close-on-end-of-try-with-resources semantics. Caller-owned: a
+     * proxy that delegates to the shared connection but no-ops close()
+     * so the adopter's lifecycle is preserved.
+     */
+    private Connection acquireConnection() throws SQLException {
+        if (callerConnection == null) return dataSource.getConnection();
+        return (Connection) Proxy.newProxyInstance(
+            Connection.class.getClassLoader(),
+            new Class<?>[] { Connection.class },
+            (proxy, method, args) -> {
+                if ("close".equals(method.getName()) && method.getParameterCount() == 0) {
+                    return null;
+                }
+                try {
+                    return method.invoke(callerConnection, args);
+                } catch (InvocationTargetException e) {
+                    throw e.getCause();
+                }
+            }
+        );
+    }
+
+    /**
+     * Run $fn against a Connection. Standalone (DataSource): acquire +
+     * close per call. Caller-owned (Connection): reuse the shared
+     * connection without closing.
+     */
+    private <T> T withConnection(TxFn<T> fn) {
+        try {
+            if (isCallerOwned()) {
+                return fn.apply(callerConnection);
+            }
+            try (Connection conn = acquireConnection()) {
+                return fn.apply(conn);
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * Build a savepoint name matching ADR 0013: {@code ft_<method>_<random>}.
+     * Caller method is read from the stack trace; falls back to {@code "tx"}
+     * for anonymous frames. Random suffix makes pairing bugs surface as
+     * loud "savepoint does not exist" errors.
+     */
+    private static String makeSavepointName() {
+        StackTraceElement[] stack = Thread.currentThread().getStackTrace();
+        // Frame layout: 0 getStackTrace, 1 makeSavepointName, 2 tx/nested,
+        // 3 the public adapter method.
+        String method = stack.length > 3 ? stack[3].getMethodName() : "tx";
+        String safe = method.replaceAll("[^A-Za-z0-9_]", "");
+        if (safe.isEmpty()) safe = "tx";
+        byte[] r = new byte[4];
+        SECURE_RANDOM.nextBytes(r);
+        StringBuilder hex = new StringBuilder(8);
+        for (byte b : r) hex.append(String.format("%02x", b & 0xff));
+        return "ft_" + safe + "_" + hex;
+    }
+
+    /**
+     * Run $fn atomically. Standalone (DataSource): acquire connection,
+     * BEGIN/COMMIT, release. Caller-owned (Connection): use
+     * {@code SAVEPOINT}/{@code RELEASE} on the existing connection per
+     * ADR 0013 — adapter cooperates with the caller's outer transaction.
+     */
     private <T> T tx(TxFn<T> fn) {
-        try (Connection conn = dataSource.getConnection()) {
+        if (isCallerOwned()) {
+            Connection conn = callerConnection;
+            try {
+                String spName = makeSavepointName();
+                Savepoint sp = conn.setSavepoint(spName);
+                try {
+                    T result = fn.apply(conn);
+                    conn.releaseSavepoint(sp);
+                    return result;
+                } catch (SQLException | RuntimeException e) {
+                    try {
+                        conn.rollback(sp);
+                        conn.releaseSavepoint(sp);
+                    } catch (SQLException ignored) {
+                    }
+                    if (e instanceof SQLException) throw new RuntimeException(e);
+                    throw (RuntimeException) e;
+                }
+            } catch (SQLException e) {
+                throw new RuntimeException(e);
+            }
+        }
+        try (Connection conn = acquireConnection()) {
             boolean prevAuto = conn.getAutoCommit();
             conn.setAutoCommit(false);
             try {
@@ -132,6 +256,39 @@ public class PostgresIdentityStore implements IdentityStore {
                 throw (RuntimeException) e;
             } finally {
                 conn.setAutoCommit(prevAuto);
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * Shield $fn with a savepoint when the store is caller-owned (i.e.
+     * inside an adopter's outer transaction); pass through to the
+     * connection directly when standalone. Used by single-statement
+     * methods that don't need their own BEGIN/COMMIT but must not
+     * contaminate an outer transaction on a constraint violation. See
+     * ADR 0013.
+     */
+    private <T> T nested(TxFn<T> fn) {
+        if (!isCallerOwned()) {
+            return withConnection(fn);
+        }
+        Connection conn = callerConnection;
+        try {
+            Savepoint sp = conn.setSavepoint(makeSavepointName());
+            try {
+                T result = fn.apply(conn);
+                conn.releaseSavepoint(sp);
+                return result;
+            } catch (SQLException | RuntimeException e) {
+                try {
+                    conn.rollback(sp);
+                    conn.releaseSavepoint(sp);
+                } catch (SQLException ignored) {
+                }
+                if (e instanceof SQLException) throw new RuntimeException(e);
+                throw (RuntimeException) e;
             }
         } catch (SQLException e) {
             throw new RuntimeException(e);
@@ -249,7 +406,7 @@ public class PostgresIdentityStore implements IdentityStore {
     @Override
     public User createUser(String displayName) {
         UUID usrUuid = UUID.fromString(Id.decode(Id.generate("usr")).uuid());
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "INSERT INTO usr (id, display_name) VALUES (?, ?)"
                    + " RETURNING id, status, display_name, created_at, updated_at")) {
@@ -270,7 +427,7 @@ public class PostgresIdentityStore implements IdentityStore {
 
     @Override
     public User getUser(String usrId) {
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "SELECT id, status, display_name, created_at, updated_at FROM usr WHERE id = ?")) {
             ps.setObject(1, wireToUuid(usrId));
@@ -286,7 +443,7 @@ public class PostgresIdentityStore implements IdentityStore {
     @Override
     public User updateUser(String usrId, String displayName) {
         UUID uuid = wireToUuid(usrId);
-        try (Connection conn = dataSource.getConnection()) {
+        try (Connection conn = acquireConnection()) {
             boolean originalAutoCommit = conn.getAutoCommit();
             conn.setAutoCommit(false);
             try {
@@ -361,7 +518,7 @@ public class PostgresIdentityStore implements IdentityStore {
         }
         sql.append(" ORDER BY id LIMIT ?");
         params.add(cappedLimit + 1);
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(sql.toString())) {
             for (int i = 0; i < params.size(); i++) {
                 ps.setObject(i + 1, params.get(i));
@@ -516,7 +673,7 @@ public class PostgresIdentityStore implements IdentityStore {
     public PasswordCredential createPasswordCredential(
             String usrId, String identifier, String password
     ) {
-        try (Connection conn = dataSource.getConnection()) {
+        try (Connection conn = acquireConnection()) {
             UUID userUuid = ensureUserActive(conn, usrId);
             UUID credUuid = UUID.fromString(Id.decode(Id.generate("cred")).uuid());
             String hash = PasswordHashing.hash(password);
@@ -546,7 +703,7 @@ public class PostgresIdentityStore implements IdentityStore {
     public PasskeyCredential createPasskeyCredential(
             String usrId, String identifier, byte[] publicKey, int signCount, String rpId
     ) {
-        try (Connection conn = dataSource.getConnection()) {
+        try (Connection conn = acquireConnection()) {
             UUID userUuid = ensureUserActive(conn, usrId);
             UUID credUuid = UUID.fromString(Id.decode(Id.generate("cred")).uuid());
             try (PreparedStatement ps = conn.prepareStatement(
@@ -578,7 +735,7 @@ public class PostgresIdentityStore implements IdentityStore {
     public OidcCredential createOidcCredential(
             String usrId, String identifier, String oidcIssuer, String oidcSubject
     ) {
-        try (Connection conn = dataSource.getConnection()) {
+        try (Connection conn = acquireConnection()) {
             UUID userUuid = ensureUserActive(conn, usrId);
             UUID credUuid = UUID.fromString(Id.decode(Id.generate("cred")).uuid());
             try (PreparedStatement ps = conn.prepareStatement(
@@ -606,7 +763,7 @@ public class PostgresIdentityStore implements IdentityStore {
 
     @Override
     public Credential getCredential(String credId) {
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "SELECT " + CRED_COLS + " FROM cred WHERE id = ?")) {
             ps.setObject(1, wireToUuid(credId));
@@ -621,7 +778,7 @@ public class PostgresIdentityStore implements IdentityStore {
 
     @Override
     public List<Credential> listCredentialsForUser(String usrId) {
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "SELECT " + CRED_COLS + " FROM cred WHERE usr_id = ? ORDER BY created_at")) {
             ps.setObject(1, wireToUuid(usrId));
@@ -637,7 +794,7 @@ public class PostgresIdentityStore implements IdentityStore {
 
     @Override
     public Credential findCredentialByIdentifier(CredentialType type, String identifier) {
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "SELECT " + CRED_COLS + " FROM cred"
                    + " WHERE type = ? AND identifier = ? AND status = 'active'")) {
@@ -896,7 +1053,7 @@ public class PostgresIdentityStore implements IdentityStore {
 
     @Override
     public VerifiedCredential verifyPassword(String identifier, String password) {
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "SELECT id, usr_id, password_hash FROM cred"
                    + " WHERE type = 'password' AND identifier = ? AND status = 'active'")) {
@@ -1001,7 +1158,7 @@ public class PostgresIdentityStore implements IdentityStore {
 
     @Override
     public Session getSession(String sesId) {
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "SELECT " + SES_COLS + " FROM ses WHERE id = ?")) {
             ps.setObject(1, wireToUuid(sesId));
@@ -1022,7 +1179,7 @@ public class PostgresIdentityStore implements IdentityStore {
         );
         if (cursor != null) sql.append(" AND id > ?");
         sql.append(" ORDER BY id LIMIT ?");
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(sql.toString())) {
             int idx = 1;
             ps.setObject(idx++, wireToUuid(usrId));
@@ -1044,7 +1201,7 @@ public class PostgresIdentityStore implements IdentityStore {
     @Override
     public Session verifySessionToken(String token) {
         byte[] tokenHash = hashTokenBytes(token);
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "SELECT " + SES_COLS + " FROM ses WHERE token_hash = ?")) {
             ps.setBytes(1, tokenHash);
@@ -1125,7 +1282,7 @@ public class PostgresIdentityStore implements IdentityStore {
 
     @Override
     public Session revokeSession(String sesId) {
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "UPDATE ses SET revoked_at = COALESCE(revoked_at, ?)"
                    + " WHERE id = ? RETURNING " + SES_COLS)) {
@@ -1162,7 +1319,7 @@ public class PostgresIdentityStore implements IdentityStore {
 
     @Override
     public TotpEnrollmentResult enrollTotpFactor(String usrId, String identifier) {
-        try (Connection conn = dataSource.getConnection()) {
+        try (Connection conn = acquireConnection()) {
             UUID userUuid = requireUserActiveForMfa(conn, usrId);
             // Partial-unique index `mfa_unique_active_singleton` only fires
             // on status='active'; new TOTP factors are inserted as 'pending',
@@ -1216,7 +1373,7 @@ public class PostgresIdentityStore implements IdentityStore {
     public WebAuthnEnrollmentResult enrollWebAuthnFactor(
             String usrId, String identifier, byte[] publicKey, long signCount, String rpId
     ) {
-        try (Connection conn = dataSource.getConnection()) {
+        try (Connection conn = acquireConnection()) {
             UUID userUuid = requireUserActiveForMfa(conn, usrId);
             Instant now = now();
             UUID mfaUuid = UUID.fromString(Id.decode(Id.generate("mfa")).uuid());
@@ -1254,7 +1411,7 @@ public class PostgresIdentityStore implements IdentityStore {
 
     @Override
     public RecoveryEnrollmentResult enrollRecoveryFactor(String usrId) {
-        try (Connection conn = dataSource.getConnection()) {
+        try (Connection conn = acquireConnection()) {
             UUID userUuid = requireUserActiveForMfa(conn, usrId);
             Instant now = now();
             String[] codes = RecoveryCodes.generateSet();
@@ -1299,7 +1456,7 @@ public class PostgresIdentityStore implements IdentityStore {
 
     @Override
     public Factor getMfaFactor(String mfaId) {
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "SELECT " + MFA_COLS + " FROM mfa WHERE id = ?")) {
             ps.setObject(1, wireToUuid(mfaId));
@@ -1314,7 +1471,7 @@ public class PostgresIdentityStore implements IdentityStore {
 
     @Override
     public List<Factor> listMfaFactors(String usrId) {
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "SELECT " + MFA_COLS + " FROM mfa WHERE usr_id = ? ORDER BY created_at")) {
             ps.setObject(1, wireToUuid(usrId));
@@ -1484,7 +1641,7 @@ public class PostgresIdentityStore implements IdentityStore {
     }
 
     private MfaVerifyResult verifyTotpProof(String usrId, String code) {
-        try (Connection conn = dataSource.getConnection();
+        try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "SELECT id, totp_secret FROM mfa"
                    + " WHERE usr_id = ? AND type = 'totp' AND status = 'active'")) {
@@ -1612,7 +1769,7 @@ public class PostgresIdentityStore implements IdentityStore {
     @Override
     public UserMfaPolicy getMfaPolicy(String usrId) {
         UUID uuid = wireToUuid(usrId);
-        try (Connection conn = dataSource.getConnection()) {
+        try (Connection conn = acquireConnection()) {
             try (PreparedStatement ps = conn.prepareStatement("SELECT id FROM usr WHERE id = ?")) {
                 ps.setObject(1, uuid);
                 try (ResultSet rs = ps.executeQuery()) {
@@ -1635,7 +1792,7 @@ public class PostgresIdentityStore implements IdentityStore {
     @Override
     public UserMfaPolicy setMfaPolicy(String usrId, boolean required, Instant graceUntil) {
         UUID uuid = wireToUuid(usrId);
-        try (Connection conn = dataSource.getConnection()) {
+        try (Connection conn = acquireConnection()) {
             try (PreparedStatement ps = conn.prepareStatement("SELECT id FROM usr WHERE id = ?")) {
                 ps.setObject(1, uuid);
                 try (ResultSet rs = ps.executeQuery()) {

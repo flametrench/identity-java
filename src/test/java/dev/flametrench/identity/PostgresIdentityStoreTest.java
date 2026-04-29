@@ -230,6 +230,49 @@ class PostgresIdentityStoreTest {
         assertEquals("山田 太郎", store.getUser(u.id()).displayName());
     }
 
+    // ─── Outer-transaction nesting (ADR 0013) ───
+
+    @Test
+    void createUser_cooperatesWithOuterTransaction() throws java.sql.SQLException {
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            PostgresIdentityStore nested = new PostgresIdentityStore(conn);
+            User u = nested.createUser("Nested");
+            conn.commit();
+            User fetched = store.getUser(u.id());
+            assertEquals("Nested", fetched.displayName());
+        }
+    }
+
+    @Test
+    void outerRollback_undoesInnerCreate() throws java.sql.SQLException {
+        String userId;
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            PostgresIdentityStore nested = new PostgresIdentityStore(conn);
+            User u = nested.createUser();
+            userId = u.id();
+            conn.rollback();
+        }
+        assertThrows(NotFoundError.class, () -> store.getUser(userId));
+    }
+
+    @Test
+    void multipleCallsInOuterTransactionCommitOrRollbackTogether() throws java.sql.SQLException {
+        String aId, bId;
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            PostgresIdentityStore nested = new PostgresIdentityStore(conn);
+            User a = nested.createUser();
+            User b = nested.createUser();
+            aId = a.id();
+            bId = b.id();
+            conn.rollback();
+        }
+        assertThrows(NotFoundError.class, () -> store.getUser(aId));
+        assertThrows(NotFoundError.class, () -> store.getUser(bId));
+    }
+
     @Test
     void passwordCredential_roundTrip() {
         User u = store.createUser();
