@@ -148,8 +148,13 @@ public class InMemoryIdentityStore implements IdentityStore {
 
     @Override
     public User createUser() {
+        return createUser(null);
+    }
+
+    @Override
+    public User createUser(String displayName) {
         Instant now = now();
-        User u = new User(Id.generate("usr"), Status.ACTIVE, now, now);
+        User u = new User(Id.generate("usr"), Status.ACTIVE, now, now, displayName);
         users.put(u.id(), u);
         return u;
     }
@@ -157,6 +162,21 @@ public class InMemoryIdentityStore implements IdentityStore {
     @Override
     public User getUser(String usrId) {
         return requireUser(usrId);
+    }
+
+    @Override
+    public User updateUser(String usrId, String displayName) {
+        User u = requireUser(usrId);
+        if (u.status() == Status.REVOKED) {
+            throw new AlreadyTerminalError("User " + usrId + " is revoked; cannot update");
+        }
+        String newDisplayName = UNSET.equals(displayName) ? u.displayName() : displayName;
+        if (java.util.Objects.equals(newDisplayName, u.displayName())) {
+            return u;
+        }
+        User updated = u.withDisplayName(newDisplayName, now());
+        users.put(usrId, updated);
+        return updated;
     }
 
     @Override

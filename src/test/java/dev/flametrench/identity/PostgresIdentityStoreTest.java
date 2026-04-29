@@ -103,6 +103,61 @@ class PostgresIdentityStoreTest {
         assertThrows(AlreadyTerminalError.class, () -> store.revokeUser(u.id()));
     }
 
+    // ─── display_name (ADR 0014) ───
+
+    @Test
+    void createUser_storesDisplayName() {
+        User u = store.createUser("Alice");
+        assertEquals("Alice", u.displayName());
+        assertEquals("Alice", store.getUser(u.id()).displayName());
+    }
+
+    @Test
+    void createUser_defaultsDisplayNameToNull() {
+        User u = store.createUser();
+        assertNull(u.displayName());
+    }
+
+    @Test
+    void updateUser_setNoOpClear() {
+        User u = store.createUser("Original");
+        User renamed = store.updateUser(u.id(), "Renamed");
+        assertEquals("Renamed", renamed.displayName());
+        User unchanged = store.updateUser(u.id(), IdentityStore.UNSET);
+        assertEquals("Renamed", unchanged.displayName());
+        User cleared = store.updateUser(u.id(), null);
+        assertNull(cleared.displayName());
+    }
+
+    @Test
+    void updateUser_allowsRenamingSuspended() {
+        User u = store.createUser("Before");
+        store.suspendUser(u.id());
+        User renamed = store.updateUser(u.id(), "After");
+        assertEquals("After", renamed.displayName());
+        assertEquals(Status.SUSPENDED, renamed.status());
+    }
+
+    @Test
+    void updateUser_revokedRejected() {
+        User u = store.createUser();
+        store.revokeUser(u.id());
+        assertThrows(AlreadyTerminalError.class,
+                () -> store.updateUser(u.id(), "Whatever"));
+    }
+
+    @Test
+    void updateUser_unknownRejected() {
+        assertThrows(NotFoundError.class,
+                () -> store.updateUser(dev.flametrench.ids.Id.generate("usr"), "ghost"));
+    }
+
+    @Test
+    void displayName_unicodeRoundTrip() {
+        User u = store.createUser("山田 太郎");
+        assertEquals("山田 太郎", store.getUser(u.id()).displayName());
+    }
+
     @Test
     void passwordCredential_roundTrip() {
         User u = store.createUser();

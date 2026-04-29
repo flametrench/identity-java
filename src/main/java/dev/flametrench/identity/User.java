@@ -9,9 +9,15 @@ public record User(
         String id,
         Status status,
         Instant createdAt,
-        Instant updatedAt
+        Instant updatedAt,
+        /** v0.2 (ADR 0014) — optional human-meaningful render string. */
+        String displayName
 ) {
     public User withStatus(Status status, Instant updatedAt) {
-        return new User(id, status, createdAt, updatedAt);
+        return new User(id, status, createdAt, updatedAt, displayName);
+    }
+
+    public User withDisplayName(String displayName, Instant updatedAt) {
+        return new User(id, status, createdAt, updatedAt, displayName);
     }
 }

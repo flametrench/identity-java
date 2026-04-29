@@ -54,6 +54,57 @@ class InMemoryIdentityStoreTest {
         assertThrows(AlreadyTerminalError.class, () -> store.revokeUser(u.id()));
     }
 
+    // ─── display_name (ADR 0014) ───
+
+    @Test
+    void createUserStoresDisplayName() {
+        User u = store.createUser("Alice");
+        assertEquals("Alice", u.displayName());
+        assertEquals("Alice", store.getUser(u.id()).displayName());
+    }
+
+    @Test
+    void createUserDefaultsDisplayNameToNull() {
+        User u = store.createUser();
+        assertNull(u.displayName());
+    }
+
+    @Test
+    void updateUserSetNoOpClear() {
+        User u = store.createUser("Original");
+        User renamed = store.updateUser(u.id(), "Renamed");
+        assertEquals("Renamed", renamed.displayName());
+        // UNSET means "no change".
+        User unchanged = store.updateUser(u.id(), IdentityStore.UNSET);
+        assertEquals("Renamed", unchanged.displayName());
+        // null means "clear".
+        User cleared = store.updateUser(u.id(), null);
+        assertNull(cleared.displayName());
+    }
+
+    @Test
+    void updateUserAllowsRenamingSuspended() {
+        User u = store.createUser("Before");
+        store.suspendUser(u.id());
+        User renamed = store.updateUser(u.id(), "After");
+        assertEquals("After", renamed.displayName());
+        assertEquals(Status.SUSPENDED, renamed.status());
+    }
+
+    @Test
+    void updateUserRevokedRejected() {
+        User u = store.createUser();
+        store.revokeUser(u.id());
+        assertThrows(AlreadyTerminalError.class,
+                () -> store.updateUser(u.id(), "Whatever"));
+    }
+
+    @Test
+    void displayNameUnicodeRoundTrip() {
+        User u = store.createUser("山田 太郎");
+        assertEquals("山田 太郎", store.getUser(u.id()).displayName());
+    }
+
     // ─── Password credentials ───
 
     @Test

@@ -145,7 +145,8 @@ public class PostgresIdentityStore implements IdentityStore {
                 Id.encode("usr", rs.getString("id")),
                 Status.valueOf(rs.getString("status").toUpperCase()),
                 rs.getTimestamp("created_at").toInstant(),
-                rs.getTimestamp("updated_at").toInstant()
+                rs.getTimestamp("updated_at").toInstant(),
+                rs.getString("display_name")
         );
     }
 
@@ -242,12 +243,22 @@ public class PostgresIdentityStore implements IdentityStore {
 
     @Override
     public User createUser() {
+        return createUser(null);
+    }
+
+    @Override
+    public User createUser(String displayName) {
         UUID usrUuid = UUID.fromString(Id.decode(Id.generate("usr")).uuid());
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(
-                     "INSERT INTO usr (id) VALUES (?)"
-                   + " RETURNING id, status, created_at, updated_at")) {
+                     "INSERT INTO usr (id, display_name) VALUES (?, ?)"
+                   + " RETURNING id, status, display_name, created_at, updated_at")) {
             ps.setObject(1, usrUuid);
+            if (displayName == null) {
+                ps.setNull(2, java.sql.Types.VARCHAR);
+            } else {
+                ps.setString(2, displayName);
+            }
             try (ResultSet rs = ps.executeQuery()) {
                 rs.next();
                 return rowToUser(rs);
@@ -261,11 +272,61 @@ public class PostgresIdentityStore implements IdentityStore {
     public User getUser(String usrId) {
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(
-                     "SELECT id, status, created_at, updated_at FROM usr WHERE id = ?")) {
+                     "SELECT id, status, display_name, created_at, updated_at FROM usr WHERE id = ?")) {
             ps.setObject(1, wireToUuid(usrId));
             try (ResultSet rs = ps.executeQuery()) {
                 if (!rs.next()) throw new NotFoundError("User " + usrId + " not found");
                 return rowToUser(rs);
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    @Override
+    public User updateUser(String usrId, String displayName) {
+        UUID uuid = wireToUuid(usrId);
+        try (Connection conn = dataSource.getConnection()) {
+            boolean originalAutoCommit = conn.getAutoCommit();
+            conn.setAutoCommit(false);
+            try {
+                String currentDisplayName;
+                Status currentStatus;
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "SELECT status, display_name FROM usr WHERE id = ? FOR UPDATE")) {
+                    ps.setObject(1, uuid);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (!rs.next()) throw new NotFoundError("User " + usrId + " not found");
+                        currentStatus = Status.valueOf(rs.getString("status").toUpperCase());
+                        currentDisplayName = rs.getString("display_name");
+                    }
+                }
+                if (currentStatus == Status.REVOKED) {
+                    throw new AlreadyTerminalError("User " + usrId + " is revoked; cannot update");
+                }
+                String newDisplayName = UNSET.equals(displayName) ? currentDisplayName : displayName;
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "UPDATE usr SET display_name = ?, updated_at = now()"
+                      + " WHERE id = ?"
+                      + " RETURNING id, status, display_name, created_at, updated_at")) {
+                    if (newDisplayName == null) {
+                        ps.setNull(1, java.sql.Types.VARCHAR);
+                    } else {
+                        ps.setString(1, newDisplayName);
+                    }
+                    ps.setObject(2, uuid);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        rs.next();
+                        User updated = rowToUser(rs);
+                        conn.commit();
+                        return updated;
+                    }
+                }
+            } catch (RuntimeException | SQLException e) {
+                conn.rollback();
+                throw e;
+            } finally {
+                conn.setAutoCommit(originalAutoCommit);
             }
         } catch (SQLException e) {
             throw new RuntimeException(e);
@@ -293,7 +354,7 @@ public class PostgresIdentityStore implements IdentityStore {
             }
             try (PreparedStatement ps = conn.prepareStatement(
                     "UPDATE usr SET status = 'suspended' WHERE id = ?"
-                  + " RETURNING id, status, created_at, updated_at")) {
+                  + " RETURNING id, status, display_name, created_at, updated_at")) {
                 ps.setObject(1, uuid);
                 User updated;
                 try (ResultSet rs = ps.executeQuery()) {
@@ -332,7 +393,7 @@ public class PostgresIdentityStore implements IdentityStore {
             }
             try (PreparedStatement ps = conn.prepareStatement(
                     "UPDATE usr SET status = 'active' WHERE id = ?"
-                  + " RETURNING id, status, created_at, updated_at")) {
+                  + " RETURNING id, status, display_name, created_at, updated_at")) {
                 ps.setObject(1, uuid);
                 try (ResultSet rs = ps.executeQuery()) {
                     rs.next();
@@ -372,7 +433,7 @@ public class PostgresIdentityStore implements IdentityStore {
             }
             try (PreparedStatement ps = conn.prepareStatement(
                     "UPDATE usr SET status = 'revoked' WHERE id = ?"
-                  + " RETURNING id, status, created_at, updated_at")) {
+                  + " RETURNING id, status, display_name, created_at, updated_at")) {
                 ps.setObject(1, uuid);
                 try (ResultSet rs = ps.executeQuery()) {
                     rs.next();

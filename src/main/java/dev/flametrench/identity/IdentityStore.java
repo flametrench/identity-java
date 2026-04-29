@@ -22,9 +22,28 @@ import java.util.List;
  */
 public interface IdentityStore {
 
+    /**
+     * Sentinel for {@link #updateUser} partial-update semantics (ADR 0014).
+     * Pass this constant to skip a field (its value is preserved); pass
+     * {@code null} to clear the field.
+     */
+    String UNSET = "__flametrench_unset__";
+
     // ─── Users ───
+    /** v0.1-compatible 0-arg createUser. Defaults displayName to null. */
     User createUser();
+    /** v0.2 (ADR 0014) createUser accepting an optional displayName. */
+    User createUser(String displayName);
     User getUser(String usrId);
+    /**
+     * ADR 0014 partial update of v0.2 user metadata.
+     *
+     * <p>Pass {@link #UNSET} to skip the field; pass {@code null} to
+     * clear it. Updating a revoked user raises
+     * {@link AlreadyTerminalError}; an unknown id raises
+     * {@link NotFoundError}.
+     */
+    User updateUser(String usrId, String displayName);
     User suspendUser(String usrId);
     User reinstateUser(String usrId);
     User revokeUser(String usrId);
