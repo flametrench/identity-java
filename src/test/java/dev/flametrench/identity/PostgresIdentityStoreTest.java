@@ -274,6 +274,30 @@ class PostgresIdentityStoreTest {
     }
 
     @Test
+    void outerCanCommitAfterFirstRollsBackSavepoint() throws java.sql.SQLException {
+        // Seed a credential outside the outer txn so the nested duplicate fails.
+        User seed = store.createUser();
+        store.createPasswordCredential(seed.id(), "taken@example.test", "long-enough-password");
+
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            PostgresIdentityStore nested = new PostgresIdentityStore(conn);
+            User u = nested.createUser();
+            // Duplicate identifier — should rollback to savepoint, NOT poison
+            // the outer txn.
+            assertThrows(DuplicateCredentialError.class, () -> nested.createPasswordCredential(
+                    u.id(), "taken@example.test", "long-enough-password"
+            ));
+            // Outer txn must still be usable.
+            PasswordCredential survivor = nested.createPasswordCredential(
+                    u.id(), "survivor@example.test", "long-enough-password"
+            );
+            assertEquals("survivor@example.test", survivor.identifier());
+            conn.commit();
+        }
+    }
+
+    @Test
     void passwordCredential_roundTrip() {
         User u = store.createUser();
         PasswordCredential cred = store.createPasswordCredential(

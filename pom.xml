@@ -7,7 +7,7 @@
 
     <groupId>dev.flametrench</groupId>
     <artifactId>identity</artifactId>
-    <version>0.2.0-rc.7</version>
+    <version>0.2.0-rc.8</version>
     <packaging>jar</packaging>
 
     <name>flametrench-identity</name>

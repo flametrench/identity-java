@@ -405,24 +405,23 @@ public class PostgresIdentityStore implements IdentityStore {
 
     @Override
     public User createUser(String displayName) {
-        UUID usrUuid = UUID.fromString(Id.decode(Id.generate("usr")).uuid());
-        try (Connection conn = acquireConnection();
-             PreparedStatement ps = conn.prepareStatement(
-                     "INSERT INTO usr (id, display_name) VALUES (?, ?)"
-                   + " RETURNING id, status, display_name, created_at, updated_at")) {
-            ps.setObject(1, usrUuid);
-            if (displayName == null) {
-                ps.setNull(2, java.sql.Types.VARCHAR);
-            } else {
-                ps.setString(2, displayName);
+        return nested(conn -> {
+            UUID usrUuid = UUID.fromString(Id.decode(Id.generate("usr")).uuid());
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "INSERT INTO usr (id, display_name) VALUES (?, ?)"
+                  + " RETURNING id, status, display_name, created_at, updated_at")) {
+                ps.setObject(1, usrUuid);
+                if (displayName == null) {
+                    ps.setNull(2, java.sql.Types.VARCHAR);
+                } else {
+                    ps.setString(2, displayName);
+                }
+                try (ResultSet rs = ps.executeQuery()) {
+                    rs.next();
+                    return rowToUser(rs);
+                }
             }
-            try (ResultSet rs = ps.executeQuery()) {
-                rs.next();
-                return rowToUser(rs);
-            }
-        } catch (SQLException e) {
-            throw new RuntimeException(e);
-        }
+        });
     }
 
     @Override
@@ -673,7 +672,7 @@ public class PostgresIdentityStore implements IdentityStore {
     public PasswordCredential createPasswordCredential(
             String usrId, String identifier, String password
     ) {
-        try (Connection conn = acquireConnection()) {
+        return nested(conn -> {
             UUID userUuid = ensureUserActive(conn, usrId);
             UUID credUuid = UUID.fromString(Id.decode(Id.generate("cred")).uuid());
             String hash = PasswordHashing.hash(password);
@@ -688,22 +687,22 @@ public class PostgresIdentityStore implements IdentityStore {
                     rs.next();
                     return (PasswordCredential) rowToCred(rs);
                 }
+            } catch (SQLException e) {
+                if (isUniqueViolation(e)) {
+                    throw new DuplicateCredentialError(
+                            "An active password credential already exists for identifier " + identifier
+                    );
+                }
+                throw e;
             }
-        } catch (SQLException e) {
-            if (isUniqueViolation(e)) {
-                throw new DuplicateCredentialError(
-                        "An active password credential already exists for identifier " + identifier
-                );
-            }
-            throw new RuntimeException(e);
-        }
+        });
     }
 
     @Override
     public PasskeyCredential createPasskeyCredential(
             String usrId, String identifier, byte[] publicKey, int signCount, String rpId
     ) {
-        try (Connection conn = acquireConnection()) {
+        return nested(conn -> {
             UUID userUuid = ensureUserActive(conn, usrId);
             UUID credUuid = UUID.fromString(Id.decode(Id.generate("cred")).uuid());
             try (PreparedStatement ps = conn.prepareStatement(
@@ -720,22 +719,22 @@ public class PostgresIdentityStore implements IdentityStore {
                     rs.next();
                     return (PasskeyCredential) rowToCred(rs);
                 }
+            } catch (SQLException e) {
+                if (isUniqueViolation(e)) {
+                    throw new DuplicateCredentialError(
+                            "An active passkey credential already exists for identifier " + identifier
+                    );
+                }
+                throw e;
             }
-        } catch (SQLException e) {
-            if (isUniqueViolation(e)) {
-                throw new DuplicateCredentialError(
-                        "An active passkey credential already exists for identifier " + identifier
-                );
-            }
-            throw new RuntimeException(e);
-        }
+        });
     }
 
     @Override
     public OidcCredential createOidcCredential(
             String usrId, String identifier, String oidcIssuer, String oidcSubject
     ) {
-        try (Connection conn = acquireConnection()) {
+        return nested(conn -> {
             UUID userUuid = ensureUserActive(conn, usrId);
             UUID credUuid = UUID.fromString(Id.decode(Id.generate("cred")).uuid());
             try (PreparedStatement ps = conn.prepareStatement(
@@ -750,15 +749,15 @@ public class PostgresIdentityStore implements IdentityStore {
                     rs.next();
                     return (OidcCredential) rowToCred(rs);
                 }
+            } catch (SQLException e) {
+                if (isUniqueViolation(e)) {
+                    throw new DuplicateCredentialError(
+                            "An active oidc credential already exists for identifier " + identifier
+                    );
+                }
+                throw e;
             }
-        } catch (SQLException e) {
-            if (isUniqueViolation(e)) {
-                throw new DuplicateCredentialError(
-                        "An active oidc credential already exists for identifier " + identifier
-                );
-            }
-            throw new RuntimeException(e);
-        }
+        });
     }
 
     @Override
