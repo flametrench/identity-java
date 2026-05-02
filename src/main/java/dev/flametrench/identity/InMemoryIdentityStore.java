@@ -1126,8 +1126,15 @@ public class InMemoryIdentityStore implements IdentityStore {
         String patId = "pat_" + idHex;
 
         // Step 3–4: lookup; conflate "no row" with "wrong secret".
+        // security-audit-v0.3.md H2: when the row is missing we still
+        // perform an Argon2id verify against a dummy hash so the
+        // wall-clock time of "no such pat_id" matches the
+        // row-exists-but-wrong-secret path.
         PersonalAccessToken pat = pats.get(patId);
-        if (pat == null) throw new InvalidPatTokenError();
+        if (pat == null) {
+            PasswordHashing.verify(PatLimits.DUMMY_PHC_HASH, secretSegment);
+            throw new InvalidPatTokenError();
+        }
         // Step 5: revoked terminal check.
         if (pat.revokedAt() != null) throw new PatRevokedError(patId);
         // Step 6: expiry.

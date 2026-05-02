@@ -2047,6 +2047,9 @@ public class PostgresIdentityStore implements IdentityStore {
         try {
             patUuid = wireToUuid(patId);
         } catch (RuntimeException e) {
+            // security-audit-v0.3.md H2: timing-oracle defense for
+            // structurally-valid-but-not-UUIDv7 ids.
+            PasswordHashing.verify(PatLimits.DUMMY_PHC_HASH, secretSegment);
             throw new InvalidPatTokenError();
         }
         return withConnection(conn -> {
@@ -2059,7 +2062,13 @@ public class PostgresIdentityStore implements IdentityStore {
                 ps.setObject(1, patUuid);
                 try (ResultSet rs = ps.executeQuery()) {
                     // Step 4: missing → conflated InvalidPatTokenError.
-                    if (!rs.next()) throw new InvalidPatTokenError();
+                    // security-audit-v0.3.md H2: perform Argon2id verify
+                    // against dummy hash so wall-clock time matches the
+                    // row-exists path.
+                    if (!rs.next()) {
+                        PasswordHashing.verify(PatLimits.DUMMY_PHC_HASH, secretSegment);
+                        throw new InvalidPatTokenError();
+                    }
                     // Step 5: revoked terminal check.
                     if (rs.getTimestamp(8) != null) throw new PatRevokedError(patId);
                     // Step 6: expiry.
