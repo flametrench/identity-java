@@ -1862,6 +1862,16 @@ public class PostgresIdentityStore implements IdentityStore {
                     "PAT expires_at must be strictly in the future",
                     "pat.expires_in_past");
         }
+        // security-audit-v0.3.md H1: 365-day cap from ADR 0016 §"Constraints".
+        if (expiresAt != null
+                && (expiresAt.getEpochSecond() - now.getEpochSecond())
+                        > PatLimits.MAX_LIFETIME_SECONDS) {
+            throw new PreconditionError(
+                    "PAT expires_at exceeds the spec cap of "
+                            + PatLimits.MAX_LIFETIME_SECONDS
+                            + " seconds (365 days) from creation",
+                    "pat.expires_too_far");
+        }
         java.util.List<String> scopeCopy = scope == null
                 ? java.util.List.of()
                 : java.util.List.copyOf(scope);

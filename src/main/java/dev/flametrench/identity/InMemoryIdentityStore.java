@@ -1021,6 +1021,16 @@ public class InMemoryIdentityStore implements IdentityStore {
                     "PAT expires_at must be strictly in the future",
                     "pat.expires_in_past");
         }
+        // security-audit-v0.3.md H1: 365-day cap from ADR 0016 §"Constraints".
+        if (expiresAt != null
+                && (expiresAt.getEpochSecond() - now.getEpochSecond())
+                        > PatLimits.MAX_LIFETIME_SECONDS) {
+            throw new PreconditionError(
+                    "PAT expires_at exceeds the spec cap of "
+                            + PatLimits.MAX_LIFETIME_SECONDS
+                            + " seconds (365 days) from creation",
+                    "pat.expires_too_far");
+        }
         String patId = dev.flametrench.ids.Id.generate("pat");
         String idHexSegment = patId.substring(4); // strip 'pat_'
         byte[] secretBytes = new byte[32];

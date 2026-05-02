@@ -112,6 +112,24 @@ class PatTest {
                     () -> store.createPat(u.id(), "cli", List.of(), Instant.parse("2026-04-01T00:00:00Z")));
         }
 
+        // security-audit-v0.3.md H1: ADR 0016 §"Constraints" caps expires_at
+        // at 365 days from creation. Pre-fix this was unenforced.
+        @Test
+        void createPat_acceptsExpiryAtCap() {
+            User u = store.createUser();
+            Instant exp = clock.instant().plusSeconds(365L * 86400L);
+            CreatePatResult r = store.createPat(u.id(), "cli", List.of(), exp);
+            assertEquals(exp, r.pat().expiresAt());
+        }
+
+        @Test
+        void createPat_rejectsExpiryBeyondCap() {
+            User u = store.createUser();
+            Instant exp = clock.instant().plusSeconds(365L * 86400L + 1L);
+            assertThrows(PreconditionError.class,
+                    () -> store.createPat(u.id(), "cli", List.of(), exp));
+        }
+
         @Test
         void createPat_refusesRevokedUser() {
             User u = store.createUser();
