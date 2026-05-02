@@ -151,27 +151,53 @@ public interface IdentityStore {
      * Adopters MUST surface the plaintext to the user immediately and
      * never persist it server-side.
      *
-     * <p>Authorization gating is the adopter's responsibility — typically
-     * "the requesting principal owns usrId, OR is a sysadmin acting on
-     * the user's behalf." The SDK does not enforce.
+     * <p><b>@security</b> Adopter MUST gate this call so the
+     * requesting principal either owns {@code usrId} OR is a
+     * sysadmin acting on the user's behalf. The SDK does not
+     * enforce. Without route-layer gating, any authenticated user
+     * can mint PATs in any other user's name.
+     * (security-audit-v0.3.md H7.)
      *
      * @param usrId owner of the new token
-     * @param name human-readable label, 1–120 chars
+     * @param name human-readable label, 1–120 Unicode code units
      * @param scope application-defined scope claims; may be empty
      * @param expiresAt optional expiry; null means no expiry
      */
     CreatePatResult createPat(String usrId, String name, java.util.List<String> scope, java.time.Instant expiresAt);
 
+    /**
+     * Read a single PAT row by id.
+     *
+     * <p><b>@security</b> Adopter MUST gate so the requesting
+     * principal either owns the PAT (matches {@code usrId} of the
+     * row) OR is a sysadmin. The SDK returns the row regardless —
+     * without gating, an unauthenticated / wrong-principal request
+     * leaks the PAT's existence, scope, and metadata.
+     * (security-audit-v0.3.md H7.)
+     */
     PersonalAccessToken getPat(String patId);
 
     /**
      * Cursor-paginated PAT list for a user. Mirrors listMembers shape.
      *
+     * <p><b>@security</b> Adopter MUST gate so the requesting
+     * principal either is {@code usrId} OR is a sysadmin. Without
+     * gating, any caller can enumerate any user's PATs.
+     * (security-audit-v0.3.md H7.)
+     *
      * @param status filter by derived status; null returns all
      */
     Page<PersonalAccessToken> listPatsForUser(String usrId, String cursor, int limit, PatStatus status);
 
-    /** Idempotent: revoking an already-revoked PAT returns the existing row. */
+    /**
+     * Idempotent: revoking an already-revoked PAT returns the existing row.
+     *
+     * <p><b>@security</b> Adopter MUST gate so the requesting
+     * principal either owns the PAT OR is a sysadmin. Without
+     * gating, any caller can revoke any user's PAT — locking the
+     * legitimate owner out of their own automation.
+     * (security-audit-v0.3.md H7.)
+     */
     PersonalAccessToken revokePat(String patId);
 
     /**
