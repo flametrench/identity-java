@@ -47,6 +47,37 @@ public final class PatLimits {
      */
     public static final int MAX_SECRET_LENGTH = 256;
 
+    private static final java.util.regex.Pattern WIRE_FORMAT =
+            java.util.regex.Pattern.compile("^pat_[0-9a-f]{32}_[A-Za-z0-9_\\-]+$");
+
+    /**
+     * security-audit-v0.3.md M5 — pure structural validator for PAT
+     * bearer tokens per ADR 0016 §"Wire format". Returns true if
+     * {@code token} matches {@code pat_<32 lowercase hex>_<base64url>}.
+     * Does NOT hit the database or Argon2id verifier — adopters that
+     * pre-screen bearers before dispatch can use this to short-circuit
+     * obviously-bogus PATs. Mirrors the conformance fixture
+     * {@code spec/conformance/fixtures/identity/pat/token-format.json}.
+     */
+    public static boolean isStructurallyValidToken(String token) {
+        return token != null && WIRE_FORMAT.matcher(token).matches();
+    }
+
+    /**
+     * security-audit-v0.3.md M5 — pure prefix classifier per ADR 0016
+     * §"Bearer routing". Returns the {@code auth.kind} discriminator
+     * ({@code "pat"} / {@code "share"} / {@code "session"}) without
+     * invoking any verifier or DB lookup. Mirrors the conformance
+     * fixture
+     * {@code spec/conformance/fixtures/identity/pat/bearer-prefix-routing.json}.
+     */
+    public static String classifyBearer(String token) {
+        if (token == null) return "session";
+        if (token.startsWith("pat_")) return "pat";
+        if (token.startsWith("shr_")) return "share";
+        return "session";
+    }
+
     private PatLimits() {
         // utility
     }

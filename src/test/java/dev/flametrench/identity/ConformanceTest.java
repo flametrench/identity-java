@@ -115,6 +115,40 @@ class ConformanceTest {
         return webauthnFactory("identity/mfa/webauthn-assertion-algorithms.json");
     }
 
+    // v0.3 — security-audit-v0.3.md M5: every SDK consumes the PAT fixtures.
+
+    @TestFactory
+    List<DynamicTest> patTokenFormatConformance() throws IOException {
+        JsonNode fixture = loadFixture("identity/pat/token-format.json");
+        List<DynamicTest> tests = new ArrayList<>();
+        for (JsonNode t : fixture.get("tests")) {
+            String id = t.get("id").asText();
+            String desc = t.get("description").asText();
+            tests.add(DynamicTest.dynamicTest("[" + id + "] " + desc, () -> {
+                String token = t.get("input").get("token").asText();
+                boolean expected = t.get("expected").get("result").asBoolean();
+                assertEquals(expected, PatLimits.isStructurallyValidToken(token));
+            }));
+        }
+        return tests;
+    }
+
+    @TestFactory
+    List<DynamicTest> patBearerRoutingConformance() throws IOException {
+        JsonNode fixture = loadFixture("identity/pat/bearer-prefix-routing.json");
+        List<DynamicTest> tests = new ArrayList<>();
+        for (JsonNode t : fixture.get("tests")) {
+            String id = t.get("id").asText();
+            String desc = t.get("description").asText();
+            tests.add(DynamicTest.dynamicTest("[" + id + "] " + desc, () -> {
+                String token = t.get("input").get("token").asText();
+                String expected = t.get("expected").get("result").asText();
+                assertEquals(expected, PatLimits.classifyBearer(token));
+            }));
+        }
+        return tests;
+    }
+
     private List<DynamicTest> webauthnFactory(String relativePath) throws IOException {
         JsonNode fixture = loadFixture(relativePath);
         JsonNode shared = fixture.has("shared") ? fixture.get("shared") : MAPPER.createObjectNode();
