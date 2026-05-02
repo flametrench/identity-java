@@ -3,6 +3,23 @@
 All notable changes to `dev.flametrench:identity` are recorded here.
 Spec-level changes live in [`spec/CHANGELOG.md`](https://github.com/flametrench/spec/blob/main/CHANGELOG.md).
 
+## [v0.3.0] — Unreleased (Maven Central publish blocked)
+
+### Added (personal access tokens, ADR 0016)
+- New `dev.flametrench.identity` records: `PersonalAccessToken`, `VerifiedPat`, `CreatePatResult`. New enum: `PatStatus`.
+- New exceptions: `InvalidPatTokenError`, `PatExpiredError`, `PatRevokedError`. The "no row" and "wrong secret" cases conflate to `InvalidPatTokenError` to defend against a token-presence timing oracle (ADR 0016 §"Verification semantics").
+- New methods on `IdentityStore` (implemented in both `InMemoryIdentityStore` and `PostgresIdentityStore`): `createPat`, `getPat`, `listPatsForUser`, `revokePat`, `verifyPatToken`.
+- Wire format: `pat_<32hex-id>_<base64url-secret>` (Stripe-style id-then-secret). The plaintext token is returned ONCE in `createPat` and never again — the server stores only an Argon2id hash of the secret segment at the cred-password parameter floor.
+- New `patLastUsedCoalesceSeconds` constructor option on both stores (default 60s) avoids a write-per-request hot path on the `last_used_at` column. 0 disables coalescing.
+- `PostgresIdentityStore` PAT methods cooperate with caller-owned `Connection` via `SAVEPOINT/RELEASE` (ADR 0013).
+- 32 new tests (20 `InMemory` + 12 `Pg`) using a controllable `TestClock` for deterministic last_used_at coalescing assertions.
+
+### Required dependency bump
+- `dev.flametrench:ids` constraint now `0.3.0` for the `pat` type prefix (ADR 0016).
+
+### Release status
+- Tagged in lockstep with the Node and PHP v0.3.0 cuts; Maven Central publication remains externally blocked. Local install via `mvn install -DskipTests` works for downstream consumers.
+
 ## [v0.2.0] — 2026-04-30
 
 ### Released

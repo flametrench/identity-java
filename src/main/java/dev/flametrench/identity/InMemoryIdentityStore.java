@@ -42,15 +42,30 @@ public class InMemoryIdentityStore implements IdentityStore {
     private final Map<String, Session> sessions = new LinkedHashMap<>();
     private final Map<String, String> sessionTokenHashes = new HashMap<>(); // sesId → token-hash
     private final Map<String, String> sessionByTokenHash = new HashMap<>(); // token-hash → sesId
+    // ─── v0.3 PATs (ADR 0016) ───
+    private final Map<String, PersonalAccessToken> pats = new LinkedHashMap<>();
+    private final Map<String, String> patSecretHashes = new HashMap<>(); // patId → PHC hash
+    private final Map<String, Instant> patLastUsedPersisted = new HashMap<>();
     private final Clock clock;
     private final SecureRandom random = new SecureRandom();
+    private final long patLastUsedCoalesceSeconds;
 
     public InMemoryIdentityStore() {
         this(Clock.systemUTC());
     }
 
     public InMemoryIdentityStore(Clock clock) {
+        this(clock, 60L);
+    }
+
+    /**
+     * @param patLastUsedCoalesceSeconds coalescing window for
+     *     {@code lastUsedAt} writes on {@link #verifyPatToken} per
+     *     ADR 0016 §"Operational notes". 0 disables coalescing.
+     */
+    public InMemoryIdentityStore(Clock clock, long patLastUsedCoalesceSeconds) {
         this.clock = clock;
+        this.patLastUsedCoalesceSeconds = Math.max(0, patLastUsedCoalesceSeconds);
     }
 
     private Instant now() {
@@ -981,5 +996,175 @@ public class InMemoryIdentityStore implements IdentityStore {
             out.append(alphabet[(value << (5 - bits)) & 0x1F]);
         }
         return out.toString();
+    }
+
+    // ─── v0.3 personal access tokens (ADR 0016) ───
+
+    private static final java.util.regex.Pattern PAT_HEX_PATTERN =
+            java.util.regex.Pattern.compile("[0-9a-f]{32}");
+
+    @Override
+    public CreatePatResult createPat(String usrId, String name, java.util.List<String> scope, Instant expiresAt) {
+        User u = requireUser(usrId);
+        if (u.status() == Status.REVOKED) {
+            throw new AlreadyTerminalError("User " + usrId + " is revoked; cannot issue PATs");
+        }
+        if (name == null || name.length() < 1 || name.length() > 120) {
+            int len = name == null ? 0 : name.length();
+            throw new PreconditionError(
+                    "PAT name must be 1–120 characters (got " + len + ")",
+                    "pat.name_invalid");
+        }
+        Instant now = now();
+        if (expiresAt != null && !expiresAt.isAfter(now)) {
+            throw new PreconditionError(
+                    "PAT expires_at must be strictly in the future",
+                    "pat.expires_in_past");
+        }
+        String patId = dev.flametrench.ids.Id.generate("pat");
+        String idHexSegment = patId.substring(4); // strip 'pat_'
+        byte[] secretBytes = new byte[32];
+        random.nextBytes(secretBytes);
+        String secretSegment = base64UrlEncode(secretBytes);
+        String token = "pat_" + idHexSegment + "_" + secretSegment;
+        String secretHash = PasswordHashing.hash(secretSegment);
+        java.util.List<String> scopeCopy = scope == null
+                ? java.util.List.of()
+                : java.util.List.copyOf(scope);
+
+        PersonalAccessToken pat = new PersonalAccessToken(
+                patId, usrId, name, scopeCopy, PatStatus.ACTIVE,
+                expiresAt, null, null, now, now);
+        pats.put(patId, pat);
+        patSecretHashes.put(patId, secretHash);
+        return new CreatePatResult(pat, token);
+    }
+
+    @Override
+    public PersonalAccessToken getPat(String patId) {
+        PersonalAccessToken pat = pats.get(patId);
+        if (pat == null) throw new NotFoundError("PAT " + patId + " not found");
+        return withDerivedStatus(pat);
+    }
+
+    @Override
+    public Page<PersonalAccessToken> listPatsForUser(String usrId, String cursor, int limit, PatStatus status) {
+        int effectiveLimit = Math.max(1, Math.min(limit, 200));
+        java.util.List<PersonalAccessToken> matching = new ArrayList<>();
+        for (PersonalAccessToken pat : pats.values()) {
+            if (!pat.usrId().equals(usrId)) continue;
+            PersonalAccessToken derived = withDerivedStatus(pat);
+            if (status != null && derived.status() != status) continue;
+            matching.add(derived);
+        }
+        matching.sort(java.util.Comparator.comparing(PersonalAccessToken::id));
+        int startIdx = 0;
+        if (cursor != null) {
+            for (int i = 0; i < matching.size(); i++) {
+                if (matching.get(i).id().compareTo(cursor) > 0) {
+                    startIdx = i;
+                    break;
+                }
+                startIdx = i + 1;
+            }
+        }
+        int endIdx = Math.min(startIdx + effectiveLimit, matching.size());
+        java.util.List<PersonalAccessToken> slice = matching.subList(startIdx, endIdx);
+        String nextCursor = (startIdx + effectiveLimit) < matching.size() && !slice.isEmpty()
+                ? slice.get(slice.size() - 1).id()
+                : null;
+        return new Page<>(java.util.List.copyOf(slice), nextCursor);
+    }
+
+    @Override
+    public PersonalAccessToken revokePat(String patId) {
+        PersonalAccessToken pat = pats.get(patId);
+        if (pat == null) throw new NotFoundError("PAT " + patId + " not found");
+        if (pat.revokedAt() != null) {
+            return withDerivedStatus(pat);
+        }
+        Instant now = now();
+        PersonalAccessToken updated = new PersonalAccessToken(
+                pat.id(), pat.usrId(), pat.name(), pat.scope(),
+                PatStatus.REVOKED,
+                pat.expiresAt(), pat.lastUsedAt(), now,
+                pat.createdAt(), now);
+        pats.put(patId, updated);
+        return updated;
+    }
+
+    @Override
+    public VerifiedPat verifyPatToken(String token) {
+        // Step 1–2: structural decode.
+        if (token == null || !token.startsWith("pat_")) {
+            throw new InvalidPatTokenError();
+        }
+        if (token.length() < 4 + 32 + 1 + 1) {
+            throw new InvalidPatTokenError();
+        }
+        String idHex = token.substring(4, 36);
+        if (!PAT_HEX_PATTERN.matcher(idHex).matches()) {
+            throw new InvalidPatTokenError();
+        }
+        if (token.charAt(36) != '_') {
+            throw new InvalidPatTokenError();
+        }
+        String secretSegment = token.substring(37);
+        if (secretSegment.isEmpty()) {
+            throw new InvalidPatTokenError();
+        }
+        String patId = "pat_" + idHex;
+
+        // Step 3–4: lookup; conflate "no row" with "wrong secret".
+        PersonalAccessToken pat = pats.get(patId);
+        if (pat == null) throw new InvalidPatTokenError();
+        // Step 5: revoked terminal check.
+        if (pat.revokedAt() != null) throw new PatRevokedError(patId);
+        // Step 6: expiry.
+        Instant now = now();
+        if (pat.expiresAt() != null && !pat.expiresAt().isAfter(now)) {
+            throw new PatExpiredError(patId);
+        }
+        // Step 7: Argon2id verify; conflated error shape.
+        String hash = patSecretHashes.get(patId);
+        if (hash == null || !PasswordHashing.verify(hash, secretSegment)) {
+            throw new InvalidPatTokenError();
+        }
+        // Step 8: lastUsedAt update with coalescing.
+        Instant persisted = patLastUsedPersisted.get(patId);
+        boolean shouldUpdate = persisted == null
+                || patLastUsedCoalesceSeconds == 0
+                || (now.getEpochSecond() - persisted.getEpochSecond()) >= patLastUsedCoalesceSeconds;
+        if (shouldUpdate) {
+            pats.put(patId, new PersonalAccessToken(
+                    pat.id(), pat.usrId(), pat.name(), pat.scope(),
+                    pat.status(),
+                    pat.expiresAt(), now, pat.revokedAt(),
+                    pat.createdAt(), now));
+            patLastUsedPersisted.put(patId, now);
+        }
+        return new VerifiedPat(patId, pat.usrId(), java.util.List.copyOf(pat.scope()));
+    }
+
+    private PersonalAccessToken withDerivedStatus(PersonalAccessToken pat) {
+        PatStatus derived;
+        if (pat.revokedAt() != null) {
+            derived = PatStatus.REVOKED;
+        } else if (pat.expiresAt() != null && !pat.expiresAt().isAfter(now())) {
+            derived = PatStatus.EXPIRED;
+        } else {
+            derived = PatStatus.ACTIVE;
+        }
+        if (derived == pat.status()) return pat;
+        return new PersonalAccessToken(
+                pat.id(), pat.usrId(), pat.name(), pat.scope(),
+                derived,
+                pat.expiresAt(), pat.lastUsedAt(), pat.revokedAt(),
+                pat.createdAt(), pat.updatedAt());
+    }
+
+    /** RFC 4648 §5 base64url, no padding. Matches the spec wire format. */
+    private static String base64UrlEncode(byte[] buf) {
+        return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(buf);
     }
 }

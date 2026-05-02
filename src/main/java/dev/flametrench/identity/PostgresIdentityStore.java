@@ -67,18 +67,33 @@ public class PostgresIdentityStore implements IdentityStore {
 
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
 
+    private static final String PAT_COLS =
+            "id, usr_id, name, scope, secret_hash, expires_at, last_used_at, "
+            + "revoked_at, created_at, updated_at";
+
     private final DataSource dataSource;
     private final Connection callerConnection;
     private final Clock clock;
+    private final long patLastUsedCoalesceSeconds;
 
     public PostgresIdentityStore(DataSource dataSource) {
-        this(dataSource, Clock.systemUTC());
+        this(dataSource, Clock.systemUTC(), 60L);
     }
 
     public PostgresIdentityStore(DataSource dataSource, Clock clock) {
+        this(dataSource, clock, 60L);
+    }
+
+    /**
+     * @param patLastUsedCoalesceSeconds coalescing window for
+     *     {@code lastUsedAt} writes on {@link #verifyPatToken} per
+     *     ADR 0016 §"Operational notes". 0 disables coalescing.
+     */
+    public PostgresIdentityStore(DataSource dataSource, Clock clock, long patLastUsedCoalesceSeconds) {
         this.dataSource = dataSource;
         this.callerConnection = null;
         this.clock = clock;
+        this.patLastUsedCoalesceSeconds = Math.max(0, patLastUsedCoalesceSeconds);
     }
 
     /**
@@ -95,13 +110,18 @@ public class PostgresIdentityStore implements IdentityStore {
      * lifecycle.
      */
     public PostgresIdentityStore(Connection callerConnection) {
-        this(callerConnection, Clock.systemUTC());
+        this(callerConnection, Clock.systemUTC(), 60L);
     }
 
     public PostgresIdentityStore(Connection callerConnection, Clock clock) {
+        this(callerConnection, clock, 60L);
+    }
+
+    public PostgresIdentityStore(Connection callerConnection, Clock clock, long patLastUsedCoalesceSeconds) {
         this.dataSource = null;
         this.callerConnection = callerConnection;
         this.clock = clock;
+        this.patLastUsedCoalesceSeconds = Math.max(0, patLastUsedCoalesceSeconds);
     }
 
     private Instant now() {
@@ -1820,6 +1840,295 @@ public class PostgresIdentityStore implements IdentityStore {
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
+    }
+
+    // ─── v0.3 personal access tokens (ADR 0016) ───
+
+    private static final java.util.regex.Pattern PAT_HEX_PATTERN =
+            java.util.regex.Pattern.compile("[0-9a-f]{32}");
+
+    @Override
+    public CreatePatResult createPat(String usrId, String name, java.util.List<String> scope, Instant expiresAt) {
+        UUID userUuid = wireToUuid(usrId);
+        if (name == null || name.length() < 1 || name.length() > 120) {
+            int len = name == null ? 0 : name.length();
+            throw new PreconditionError(
+                    "PAT name must be 1–120 characters (got " + len + ")",
+                    "pat.name_invalid");
+        }
+        Instant now = now();
+        if (expiresAt != null && !expiresAt.isAfter(now)) {
+            throw new PreconditionError(
+                    "PAT expires_at must be strictly in the future",
+                    "pat.expires_in_past");
+        }
+        java.util.List<String> scopeCopy = scope == null
+                ? java.util.List.of()
+                : java.util.List.copyOf(scope);
+        return tx(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT status FROM usr WHERE id = ? FOR UPDATE")) {
+                ps.setObject(1, userUuid);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        throw new NotFoundError("User " + usrId + " not found");
+                    }
+                    if ("revoked".equals(rs.getString(1))) {
+                        throw new AlreadyTerminalError(
+                                "User " + usrId + " is revoked; cannot issue PATs");
+                    }
+                }
+            }
+            String patWireId = Id.generate("pat");
+            UUID patUuid = wireToUuid(patWireId);
+            String idHexSegment = patWireId.substring(4);
+            byte[] secretBytes = new byte[32];
+            SECURE_RANDOM.nextBytes(secretBytes);
+            String secretSegment = base64UrlEncode(secretBytes);
+            String token = "pat_" + idHexSegment + "_" + secretSegment;
+            String secretHash = PasswordHashing.hash(secretSegment);
+
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "INSERT INTO pat (id, usr_id, name, scope, secret_hash, expires_at, "
+                  + "last_used_at, revoked_at, created_at, updated_at) "
+                  + "VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?) "
+                  + "RETURNING " + PAT_COLS)) {
+                ps.setObject(1, patUuid);
+                ps.setObject(2, userUuid);
+                ps.setString(3, name);
+                ps.setArray(4, conn.createArrayOf("text", scopeCopy.toArray(new String[0])));
+                ps.setString(5, secretHash);
+                if (expiresAt != null) {
+                    ps.setTimestamp(6, Timestamp.from(expiresAt));
+                } else {
+                    ps.setNull(6, Types.TIMESTAMP_WITH_TIMEZONE);
+                }
+                ps.setTimestamp(7, Timestamp.from(now));
+                ps.setTimestamp(8, Timestamp.from(now));
+                try (ResultSet rs = ps.executeQuery()) {
+                    rs.next();
+                    return new CreatePatResult(rowToPat(rs), token);
+                }
+            }
+        });
+    }
+
+    @Override
+    public PersonalAccessToken getPat(String patId) {
+        UUID patUuid = wireToUuid(patId);
+        return withConnection(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT " + PAT_COLS + " FROM pat WHERE id = ?")) {
+                ps.setObject(1, patUuid);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) throw new NotFoundError("PAT " + patId + " not found");
+                    return rowToPat(rs);
+                }
+            }
+        });
+    }
+
+    @Override
+    public Page<PersonalAccessToken> listPatsForUser(String usrId, String cursor, int limit, PatStatus status) {
+        int effectiveLimit = Math.max(1, Math.min(limit, 200));
+        UUID userUuid = wireToUuid(usrId);
+        StringBuilder sql = new StringBuilder("SELECT ").append(PAT_COLS)
+                .append(" FROM pat WHERE usr_id = ?");
+        java.util.List<Object> params = new ArrayList<>();
+        params.add(userUuid);
+        if (cursor != null) {
+            sql.append(" AND id > ?");
+            params.add(wireToUuid(cursor));
+        }
+        if (status != null) {
+            Instant now = now();
+            switch (status) {
+                case REVOKED -> sql.append(" AND revoked_at IS NOT NULL");
+                case EXPIRED -> {
+                    sql.append(" AND revoked_at IS NULL AND expires_at IS NOT NULL AND expires_at <= ?");
+                    params.add(Timestamp.from(now));
+                }
+                case ACTIVE -> {
+                    sql.append(" AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)");
+                    params.add(Timestamp.from(now));
+                }
+            }
+        }
+        sql.append(" ORDER BY id ASC LIMIT ?");
+        params.add(effectiveLimit + 1);
+        return withConnection(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
+                for (int i = 0; i < params.size(); i++) {
+                    Object p = params.get(i);
+                    if (p instanceof Integer it) ps.setInt(i + 1, it);
+                    else ps.setObject(i + 1, p);
+                }
+                try (ResultSet rs = ps.executeQuery()) {
+                    java.util.List<PersonalAccessToken> all = new ArrayList<>();
+                    while (rs.next()) all.add(rowToPat(rs));
+                    boolean hasMore = all.size() > effectiveLimit;
+                    java.util.List<PersonalAccessToken> data = hasMore
+                            ? all.subList(0, effectiveLimit)
+                            : all;
+                    String nextCursor = hasMore && !data.isEmpty()
+                            ? data.get(data.size() - 1).id()
+                            : null;
+                    return new Page<>(java.util.List.copyOf(data), nextCursor);
+                }
+            }
+        });
+    }
+
+    @Override
+    public PersonalAccessToken revokePat(String patId) {
+        UUID patUuid = wireToUuid(patId);
+        return tx(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT " + PAT_COLS + " FROM pat WHERE id = ? FOR UPDATE")) {
+                ps.setObject(1, patUuid);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) throw new NotFoundError("PAT " + patId + " not found");
+                    if (rs.getTimestamp(8) != null) {
+                        return rowToPat(rs);
+                    }
+                }
+            }
+            Instant now = now();
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE pat SET revoked_at = ?, updated_at = ? "
+                  + "WHERE id = ? RETURNING " + PAT_COLS)) {
+                ps.setTimestamp(1, Timestamp.from(now));
+                ps.setTimestamp(2, Timestamp.from(now));
+                ps.setObject(3, patUuid);
+                try (ResultSet rs = ps.executeQuery()) {
+                    rs.next();
+                    return rowToPat(rs);
+                }
+            }
+        });
+    }
+
+    @Override
+    public VerifiedPat verifyPatToken(String token) {
+        // Step 1–2: structural decode.
+        if (token == null || !token.startsWith("pat_")) {
+            throw new InvalidPatTokenError();
+        }
+        if (token.length() < 4 + 32 + 1 + 1) {
+            throw new InvalidPatTokenError();
+        }
+        String idHex = token.substring(4, 36);
+        if (!PAT_HEX_PATTERN.matcher(idHex).matches()) {
+            throw new InvalidPatTokenError();
+        }
+        if (token.charAt(36) != '_') {
+            throw new InvalidPatTokenError();
+        }
+        String secretSegment = token.substring(37);
+        if (secretSegment.isEmpty()) {
+            throw new InvalidPatTokenError();
+        }
+        String patId = "pat_" + idHex;
+
+        // Step 3: lookup. wireToUuid may throw if structurally-valid 32hex
+        // isn't a real UUID — for timing-oracle purposes that's still
+        // "invalid token", so we conflate.
+        UUID patUuid;
+        try {
+            patUuid = wireToUuid(patId);
+        } catch (RuntimeException e) {
+            throw new InvalidPatTokenError();
+        }
+        return withConnection(conn -> {
+            String secretHash;
+            String usrIdWire;
+            java.util.List<String> scope;
+            Instant lastUsedAt;
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT " + PAT_COLS + " FROM pat WHERE id = ?")) {
+                ps.setObject(1, patUuid);
+                try (ResultSet rs = ps.executeQuery()) {
+                    // Step 4: missing → conflated InvalidPatTokenError.
+                    if (!rs.next()) throw new InvalidPatTokenError();
+                    // Step 5: revoked terminal check.
+                    if (rs.getTimestamp(8) != null) throw new PatRevokedError(patId);
+                    // Step 6: expiry.
+                    Timestamp expTs = rs.getTimestamp(6);
+                    Instant now = now();
+                    if (expTs != null && !expTs.toInstant().isAfter(now)) {
+                        throw new PatExpiredError(patId);
+                    }
+                    secretHash = rs.getString(5);
+                    usrIdWire = Id.encode("usr", rs.getObject(2, UUID.class).toString());
+                    java.sql.Array arr = rs.getArray(4);
+                    scope = arr != null
+                            ? java.util.List.of((String[]) arr.getArray())
+                            : java.util.List.of();
+                    Timestamp lastTs = rs.getTimestamp(7);
+                    lastUsedAt = lastTs != null ? lastTs.toInstant() : null;
+                }
+            }
+            // Step 7: Argon2id verify; conflated error shape.
+            if (!PasswordHashing.verify(secretHash, secretSegment)) {
+                throw new InvalidPatTokenError();
+            }
+            // Step 8: lastUsedAt update with coalescing.
+            Instant now = now();
+            boolean shouldUpdate = lastUsedAt == null
+                    || patLastUsedCoalesceSeconds == 0
+                    || (now.getEpochSecond() - lastUsedAt.getEpochSecond()) >= patLastUsedCoalesceSeconds;
+            if (shouldUpdate) {
+                try (PreparedStatement upd = conn.prepareStatement(
+                        "UPDATE pat SET last_used_at = ? WHERE id = ?")) {
+                    upd.setTimestamp(1, Timestamp.from(now));
+                    upd.setObject(2, patUuid);
+                    upd.executeUpdate();
+                }
+            }
+            return new VerifiedPat(patId, usrIdWire, scope);
+        });
+    }
+
+    private PersonalAccessToken rowToPat(ResultSet rs) throws SQLException {
+        UUID id = rs.getObject(1, UUID.class);
+        UUID usrId = rs.getObject(2, UUID.class);
+        String name = rs.getString(3);
+        java.sql.Array scopeArr = rs.getArray(4);
+        java.util.List<String> scope = scopeArr != null
+                ? java.util.List.of((String[]) scopeArr.getArray())
+                : java.util.List.of();
+        Timestamp expTs = rs.getTimestamp(6);
+        Timestamp lastTs = rs.getTimestamp(7);
+        Timestamp revTs = rs.getTimestamp(8);
+        Timestamp createdTs = rs.getTimestamp(9);
+        Timestamp updatedTs = rs.getTimestamp(10);
+        Instant expiresAt = expTs != null ? expTs.toInstant() : null;
+        Instant revokedAt = revTs != null ? revTs.toInstant() : null;
+        Instant now = now();
+        PatStatus status;
+        if (revokedAt != null) {
+            status = PatStatus.REVOKED;
+        } else if (expiresAt != null && !expiresAt.isAfter(now)) {
+            status = PatStatus.EXPIRED;
+        } else {
+            status = PatStatus.ACTIVE;
+        }
+        return new PersonalAccessToken(
+                Id.encode("pat", id.toString()),
+                Id.encode("usr", usrId.toString()),
+                name,
+                scope,
+                status,
+                expiresAt,
+                lastTs != null ? lastTs.toInstant() : null,
+                revokedAt,
+                createdTs.toInstant(),
+                updatedTs.toInstant());
+    }
+
+    /** RFC 4648 §5 base64url, no padding. Matches the spec wire format. */
+    private static String base64UrlEncode(byte[] buf) {
+        return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(buf);
     }
 
     /** RFC 4648 base32 encoding (with padding). Inlined to mirror InMemoryIdentityStore. */

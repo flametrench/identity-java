@@ -138,4 +138,54 @@ public interface IdentityStore {
     UserMfaPolicy getMfaPolicy(String usrId);
 
     UserMfaPolicy setMfaPolicy(String usrId, boolean required, java.time.Instant graceUntil);
+
+    // ─── v0.3 personal access tokens (ADR 0016) ───
+
+    /**
+     * Mint a new personal access token for the user.
+     *
+     * <p>Returns the persisted record and the plaintext bearer token in
+     * {@code pat_<32hex-id>_<base64url-secret>} form. The plaintext
+     * token is returned ONCE; the server retains only an Argon2id hash
+     * of the secret segment at the cred-password parameter floor.
+     * Adopters MUST surface the plaintext to the user immediately and
+     * never persist it server-side.
+     *
+     * <p>Authorization gating is the adopter's responsibility — typically
+     * "the requesting principal owns usrId, OR is a sysadmin acting on
+     * the user's behalf." The SDK does not enforce.
+     *
+     * @param usrId owner of the new token
+     * @param name human-readable label, 1–120 chars
+     * @param scope application-defined scope claims; may be empty
+     * @param expiresAt optional expiry; null means no expiry
+     */
+    CreatePatResult createPat(String usrId, String name, java.util.List<String> scope, java.time.Instant expiresAt);
+
+    PersonalAccessToken getPat(String patId);
+
+    /**
+     * Cursor-paginated PAT list for a user. Mirrors listMembers shape.
+     *
+     * @param status filter by derived status; null returns all
+     */
+    Page<PersonalAccessToken> listPatsForUser(String usrId, String cursor, int limit, PatStatus status);
+
+    /** Idempotent: revoking an already-revoked PAT returns the existing row. */
+    PersonalAccessToken revokePat(String patId);
+
+    /**
+     * Verify a PAT bearer per ADR 0016 §"Verification semantics".
+     *
+     * <p>Throws {@link InvalidPatTokenError} for malformed tokens,
+     * missing rows, or wrong-secret matches (the missing/wrong cases
+     * MUST conflate). Throws {@link PatRevokedError} for terminal-
+     * revoked tokens. Throws {@link PatExpiredError} for past-expiry
+     * tokens.
+     *
+     * <p>On success, side-effect: updates lastUsedAt. Implementations
+     * MAY coalesce these writes within a configurable window
+     * (60s default) to avoid a write-per-request hot path.
+     */
+    VerifiedPat verifyPatToken(String token);
 }
