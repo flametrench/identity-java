@@ -158,6 +158,14 @@ public interface IdentityStore {
      * can mint PATs in any other user's name.
      * (security-audit-v0.3.md H7.)
      *
+     * <p><b>@security</b> Adopter MUST gate calls on {@code scope}.
+     * The SDK persists scope as opaque strings — it does NOT
+     * interpret them at {@code verifyPatToken} time. Unlike
+     * {@code tup.relation} (which {@code check()} enforces against
+     * the rule registry), scope is purely an audit tag unless the
+     * adopter's request handler reads {@link VerifiedPat#scope()}
+     * and gates the request. (security-audit-v0.3.md F5.)
+     *
      * @param usrId owner of the new token
      * @param name human-readable label, 1–120 Unicode code units
      * @param scope application-defined scope claims; may be empty
