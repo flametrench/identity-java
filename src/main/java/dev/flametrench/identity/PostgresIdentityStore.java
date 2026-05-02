@@ -2098,7 +2098,12 @@ public class PostgresIdentityStore implements IdentityStore {
                     || (now.getEpochSecond() - lastUsedAt.getEpochSecond()) >= patLastUsedCoalesceSeconds;
             if (shouldUpdate) {
                 try (PreparedStatement upd = conn.prepareStatement(
-                        "UPDATE pat SET last_used_at = ? WHERE id = ?")) {
+                        // security-audit-v0.3.md H3: re-check
+                        // revoked_at IS NULL so a race with revokePat
+                        // does not write last_used_at onto an
+                        // already-revoked row.
+                        "UPDATE pat SET last_used_at = ? "
+                                + "WHERE id = ? AND revoked_at IS NULL")) {
                     upd.setTimestamp(1, Timestamp.from(now));
                     upd.setObject(2, patUuid);
                     upd.executeUpdate();
