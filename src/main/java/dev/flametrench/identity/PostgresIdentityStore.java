@@ -2035,7 +2035,9 @@ public class PostgresIdentityStore implements IdentityStore {
             throw new InvalidPatTokenError();
         }
         String secretSegment = token.substring(37);
-        if (secretSegment.isEmpty()) {
+        // security-audit-v0.3.md H6: cap on secret-segment length —
+        // see InMemoryIdentityStore for rationale.
+        if (secretSegment.isEmpty() || secretSegment.length() > PatLimits.MAX_SECRET_LENGTH) {
             throw new InvalidPatTokenError();
         }
         String patId = "pat_" + idHex;
