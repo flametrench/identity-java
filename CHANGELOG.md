@@ -3,7 +3,7 @@
 All notable changes to `dev.flametrench:identity` are recorded here.
 Spec-level changes live in [`spec/CHANGELOG.md`](https://github.com/flametrench/spec/blob/main/CHANGELOG.md).
 
-## [v0.3.0] — Unreleased (Maven Central publish blocked)
+## [v0.3.0] — 2026-05-15 (tagged; Maven Central publish pending Sonatype Central Portal credential regen)
 
 ### Added (personal access tokens, ADR 0016)
 - New `dev.flametrench.identity` records: `PersonalAccessToken`, `VerifiedPat`, `CreatePatResult`. New enum: `PatStatus`.
