@@ -334,4 +334,61 @@ class InMemoryIdentityStoreTest {
         assertThrows(InvalidTokenError.class,
                 () -> store.verifySessionToken(sw.token()));
     }
+
+    // ─── PAT lifecycle (v0.3, ADR 0016) ───
+
+    @Test
+    void createAndVerifyPat() {
+        User u = store.createUser();
+        CreatePatResult result = store.createPat(
+                new CreatePatInput(u.id(), "CI token", java.util.List.of("cloud:read"), null));
+        assertNotNull(result.token());
+        assertTrue(result.token().startsWith("pat_"));
+        VerifiedPat vp = store.verifyPatToken(result.token());
+        assertEquals(u.id(), vp.usrId());
+        assertEquals(result.pat().id(), vp.patId());
+    }
+
+    @Test
+    void verifyPatRejectsWrongSecret() {
+        User u = store.createUser();
+        CreatePatResult result = store.createPat(
+                new CreatePatInput(u.id(), "test", java.util.List.of(), null));
+        String badToken = result.token().substring(0, result.token().lastIndexOf('_') + 1) + "wrongsecret";
+        assertThrows(InvalidPatTokenError.class, () -> store.verifyPatToken(badToken));
+    }
+
+    @Test
+    void revokePatPreventsVerify() {
+        User u = store.createUser();
+        CreatePatResult result = store.createPat(
+                new CreatePatInput(u.id(), "test", java.util.List.of(), null));
+        store.revokePat(result.pat().id());
+        assertThrows(PatRevokedError.class, () -> store.verifyPatToken(result.token()));
+    }
+
+    @Test
+    void revokeUserCascadeRevokePats() {
+        User u = store.createUser();
+        CreatePatResult result = store.createPat(
+                new CreatePatInput(u.id(), "test", java.util.List.of(), null));
+        store.revokeUser(u.id());
+        assertThrows(PatRevokedError.class, () -> store.verifyPatToken(result.token()));
+    }
+
+    @Test
+    void patNameValidation() {
+        User u = store.createUser();
+        assertThrows(PreconditionError.class, () -> store.createPat(
+                new CreatePatInput(u.id(), "", java.util.List.of(), null)));
+    }
+
+    @Test
+    void listPatsForUser() {
+        User u = store.createUser();
+        store.createPat(new CreatePatInput(u.id(), "PAT 1", java.util.List.of(), null));
+        store.createPat(new CreatePatInput(u.id(), "PAT 2", java.util.List.of(), null));
+        Page<PersonalAccessToken> page = store.listPatsForUser(u.id(), new ListPatsOptions(null, 50));
+        assertEquals(2, page.data().size());
+    }
 }

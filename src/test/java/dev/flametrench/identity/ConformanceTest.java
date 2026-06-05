@@ -18,6 +18,8 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 
 /**
  * Flametrench v0.1 conformance suite — Java / JUnit 5 harness for the
@@ -175,5 +177,39 @@ class ConformanceTest {
             }
         });
         return out;
+    }
+
+    // ─── v0.3: PAT conformance ───
+
+    @TestFactory
+    List<DynamicTest> patBearerPrefixRoutingConformance() throws IOException {
+        JsonNode fixture = loadFixture("identity/pat/bearer-prefix-routing.json");
+        List<DynamicTest> tests = new ArrayList<>();
+        for (JsonNode t : fixture.get("tests")) {
+            String id = t.get("id").asText();
+            String desc = t.get("description").asText();
+            tests.add(DynamicTest.dynamicTest("[" + id + "] " + desc, () -> {
+                String token = t.get("input").get("token").asText();
+                String expected = t.get("expected").get("result").asText();
+                assertEquals(expected, AuthKind.classifyBearer(token));
+            }));
+        }
+        return tests;
+    }
+
+    @TestFactory
+    List<DynamicTest> patTokenFormatConformance() throws IOException {
+        JsonNode fixture = loadFixture("identity/pat/token-format.json");
+        List<DynamicTest> tests = new ArrayList<>();
+        for (JsonNode t : fixture.get("tests")) {
+            String id = t.get("id").asText();
+            String desc = t.get("description").asText();
+            tests.add(DynamicTest.dynamicTest("[" + id + "] " + desc, () -> {
+                String token = t.get("input").get("token").asText();
+                boolean expected = t.get("expected").get("result").asBoolean();
+                assertEquals(expected, AuthKind.isStructurallyValidPatToken(token));
+            }));
+        }
+        return tests;
     }
 }

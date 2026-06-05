@@ -19,6 +19,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
  * Reference in-memory IdentityStore implementation.
@@ -42,6 +43,10 @@ public class InMemoryIdentityStore implements IdentityStore {
     private final Map<String, Session> sessions = new LinkedHashMap<>();
     private final Map<String, String> sessionTokenHashes = new HashMap<>(); // sesId → token-hash
     private final Map<String, String> sessionByTokenHash = new HashMap<>(); // token-hash → sesId
+    // PATs (v0.3, ADR 0016)
+    private final Map<String, PersonalAccessToken> pats = new LinkedHashMap<>();
+    private final Map<String, String> patSecretHashes = new HashMap<>();  // patId → PHC hash
+    private final Map<String, Instant> patLastUsedPersist = new HashMap<>();
     private final Clock clock;
     private final SecureRandom random = new SecureRandom();
 
@@ -257,6 +262,7 @@ public class InMemoryIdentityStore implements IdentityStore {
             }
         }
         cascadeRevokeSessionsForUser(usrId);
+        cascadeRevokePatsForUser(usrId, now);
         User updated = u.withStatus(Status.REVOKED, now);
         users.put(usrId, updated);
         return updated;
@@ -962,6 +968,139 @@ public class InMemoryIdentityStore implements IdentityStore {
                             + ageSec + "s > " + PENDING_FACTOR_TTL_SECONDS + "s)",
                     "pending_factor_expired");
         }
+    }
+
+    // ─── PATs (v0.3, ADR 0016) ───
+
+    private void cascadeRevokePatsForUser(String usrId, Instant now) {
+        for (Map.Entry<String, PersonalAccessToken> e : new ArrayList<>(pats.entrySet())) {
+            PersonalAccessToken p = e.getValue();
+            if (p.usrId().equals(usrId) && p.revokedAt() == null) {
+                pats.put(e.getKey(), p.withRevokedAt(now, now));
+            }
+        }
+    }
+
+    @Override
+    public CreatePatResult createPat(CreatePatInput in) {
+        if (users.get(in.usrId()) == null) {
+            throw new NotFoundError("User " + in.usrId() + " not found");
+        }
+        String name = in.name();
+        if (name == null || name.codePointCount(0, name.length()) < 1
+                || name.codePointCount(0, name.length()) > 120) {
+            throw new PreconditionError("name must be 1-120 code units", "invalid_name");
+        }
+        Instant now = now();
+        if (in.expiresAt() != null) {
+            Instant max = now.plusSeconds(365L * 24 * 60 * 60);
+            if (in.expiresAt().isAfter(max)) {
+                throw new PreconditionError("expires_at exceeds 365-day cap", "expires_too_late");
+            }
+        }
+        String patId = Id.generate("pat");
+        byte[] secretBytes = new byte[32];
+        random.nextBytes(secretBytes);
+        String secret = Base64.getUrlEncoder().withoutPadding().encodeToString(secretBytes);
+        String hash = PasswordHashing.hash(secret);
+        String token = patId + "_" + secret;
+        List<String> scope = in.scope() != null ? List.copyOf(in.scope()) : List.of();
+        PersonalAccessToken pat = new PersonalAccessToken(
+                patId, in.usrId(), name, scope, PatStatus.ACTIVE,
+                in.expiresAt(), null, null, now, now
+        );
+        pats.put(patId, pat);
+        patSecretHashes.put(patId, hash);
+        return new CreatePatResult(pat, token);
+    }
+
+    @Override
+    public PersonalAccessToken getPat(String patId) {
+        PersonalAccessToken p = pats.get(patId);
+        if (p == null) throw new NotFoundError("PAT " + patId + " not found");
+        return p;
+    }
+
+    @Override
+    public Page<PersonalAccessToken> listPatsForUser(String usrId, ListPatsOptions opts) {
+        if (users.get(usrId) == null) {
+            throw new NotFoundError("User " + usrId + " not found");
+        }
+        int limit = (opts.limit() > 0) ? opts.limit() : 50;
+        List<PersonalAccessToken> matched = pats.values().stream()
+                .filter(p -> p.usrId().equals(usrId))
+                .sorted(Comparator.comparing(PersonalAccessToken::createdAt)
+                        .thenComparing(PersonalAccessToken::id))
+                .collect(Collectors.toList());
+        int startIdx = 0;
+        if (opts.cursor() != null && !opts.cursor().isEmpty()) {
+            for (int i = 0; i < matched.size(); i++) {
+                if (matched.get(i).id().equals(opts.cursor())) {
+                    startIdx = i + 1;
+                    break;
+                }
+            }
+        }
+        int end = Math.min(startIdx + limit, matched.size());
+        List<PersonalAccessToken> data = matched.subList(startIdx, end);
+        String nextCursor = null;
+        if (end < matched.size() && !data.isEmpty()) {
+            nextCursor = data.get(data.size() - 1).id();
+        }
+        return new Page<>(List.copyOf(data), nextCursor);
+    }
+
+    @Override
+    public VerifiedPat verifyPatToken(String token) {
+        if (!AuthKind.isStructurallyValidPatToken(token)) {
+            PasswordHashing.verify(AuthKind.PAT_DUMMY_PHC_HASH, token != null ? token : "");
+            throw new InvalidPatTokenError();
+        }
+        int secondUnderscore = token.indexOf('_', 4);
+        String patId = token.substring(0, secondUnderscore);
+        String secret = token.substring(secondUnderscore + 1);
+
+        if (secret.length() > AuthKind.PAT_MAX_SECRET_LENGTH) {
+            PasswordHashing.verify(AuthKind.PAT_DUMMY_PHC_HASH, "");
+            throw new InvalidPatTokenError();
+        }
+
+        PersonalAccessToken pat = pats.get(patId);
+        if (pat == null) {
+            PasswordHashing.verify(AuthKind.PAT_DUMMY_PHC_HASH, secret);
+            throw new InvalidPatTokenError();
+        }
+        if (pat.revokedAt() != null) {
+            throw new PatRevokedError(patId);
+        }
+        Instant now = now();
+        if (pat.expiresAt() != null && !now.isBefore(pat.expiresAt())) {
+            throw new PatExpiredError(patId);
+        }
+        String hash = patSecretHashes.get(patId);
+        if (!PasswordHashing.verify(hash, secret)) {
+            throw new InvalidPatTokenError();
+        }
+
+        // Update last_used_at with 60-second coalescing.
+        Instant prev = patLastUsedPersist.get(patId);
+        if (prev == null || now.minusSeconds(60).isAfter(prev)) {
+            pats.put(patId, pat.withLastUsedAt(now, now));
+            patLastUsedPersist.put(patId, now);
+        }
+        List<String> scope = pat.scope() != null ? List.copyOf(pat.scope()) : List.of();
+        return new VerifiedPat(patId, pat.usrId(), scope);
+    }
+
+    @Override
+    public PersonalAccessToken revokePat(String patId) {
+        PersonalAccessToken p = pats.get(patId);
+        if (p == null) throw new NotFoundError("PAT " + patId + " not found");
+        if (p.revokedAt() != null) return p;
+        Instant now = now();
+        PersonalAccessToken revoked = p.withRevokedAt(now, now);
+        pats.put(patId, revoked);
+        return revoked;
     }
 
     /** Inline RFC 4648 base32 (matches Python SDK's otpauth URI). */
