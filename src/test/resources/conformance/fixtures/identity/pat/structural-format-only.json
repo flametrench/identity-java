@@ -1,0 +1,21 @@
+{
+  "$schema": "../../../fixture.schema.json",
+  "spec_version": "0.3.0",
+  "capability": "identity",
+  "operation": "verify_pat_token",
+  "conformance_level": "MUST",
+  "spec_section": "decisions/0023-v03-implementation-constants.md",
+  "description": "Convergence fixture pinning the Go-normative contract for the PAT structural validator (`isStructurallyValidPatToken` / `verify_pat_token`'s structural-decode step): its responsibility is wire-format and shape ONLY. The 256-char secret cap is NOT a structural concern — it is a verify-time control (H6, enforced before Argon2id dispatch per docs/security.md). A 257-char base64url secret is therefore STRUCTURALLY well-formed (`result: true`); it is rejected later at the verify step, not at structural validation. This is the canonical Go v0.3.2 / Node behavior. It is marked `runnable_today: false` because identity-php / Python / Java currently fold the length cap into their structural validator (returning `false`), a stricter-than-required superset. When those three relax the cap out of structural validation to converge, flip this fixture's index entry to `runnable_today: true` as part of the five-family v0.3 parity sign-off. See ADR 0023 and the PR #40 ruling.",
+  "tests": [
+    {
+      "id": "pat.structural-format-only.secret-over-256-chars-is-structurally-valid",
+      "description": "A 257-char base64url secret is STRUCTURALLY valid: the structural validator checks `pat_` prefix + 32 lowercase hex + `_` + non-empty base64url, and imposes NO length cap. The 256-char cap is enforced downstream at verify-time (before Argon2id), not here. Every conforming SDK's structural validator MUST return `true` for this token. An SDK that returns `false` is enforcing the H6 cap one layer too early and diverges the public helper across families.",
+      "input": {
+        "token": "pat_0190f2a81b3c7abc8123456789abcdef_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      },
+      "expected": {
+        "result": true
+      }
+    }
+  ]
+}

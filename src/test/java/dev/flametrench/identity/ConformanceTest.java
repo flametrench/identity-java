@@ -18,8 +18,12 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import java.util.HashMap;
 
 /**
  * Flametrench v0.1 conformance suite — Java / JUnit 5 harness for the
@@ -211,5 +215,209 @@ class ConformanceTest {
             }));
         }
         return tests;
+    }
+
+    @TestFactory
+    List<DynamicTest> patStructuralFormatOnlyConformance() throws IOException {
+        JsonNode fixture = loadFixture("identity/pat/structural-format-only.json");
+        List<DynamicTest> tests = new ArrayList<>();
+        for (JsonNode t : fixture.get("tests")) {
+            String id = t.get("id").asText();
+            String desc = t.get("description").asText();
+            tests.add(DynamicTest.dynamicTest("[" + id + "] " + desc, () -> {
+                String token = t.get("input").get("token").asText();
+                boolean expected = t.get("expected").get("result").asBoolean();
+                assertEquals(expected, AuthKind.isStructurallyValidPatToken(token));
+            }));
+        }
+        return tests;
+    }
+
+    // ─── v0.2: list-users / user-display-name conformance (ADR 0015 / ADR 0014) ───
+
+    @TestFactory
+    List<DynamicTest> listUsersConformance() throws IOException {
+        return runStepFixture("identity/list-users.json");
+    }
+
+    @TestFactory
+    List<DynamicTest> userDisplayNameConformance() throws IOException {
+        return runStepFixture("identity/user-display-name.json");
+    }
+
+    // ─── Step-DSL interpreter for fixtures with operation sequences ───
+
+    private List<DynamicTest> runStepFixture(String fixturePath) throws IOException {
+        JsonNode fixture = loadFixture(fixturePath);
+        List<DynamicTest> tests = new ArrayList<>();
+        for (JsonNode t : fixture.get("tests")) {
+            String id = t.get("id").asText();
+            String desc = t.get("description").asText();
+            tests.add(DynamicTest.dynamicTest("[" + id + "] " + desc, () -> {
+                InMemoryIdentityStore store = new InMemoryIdentityStore();
+                Map<String, String> vars = new HashMap<>();
+                for (JsonNode step : t.get("steps")) {
+                    executeStep(store, step, vars);
+                }
+            }));
+        }
+        return tests;
+    }
+
+    private void executeStep(
+            InMemoryIdentityStore store, JsonNode step, Map<String, String> vars
+    ) {
+        String op = step.get("op").asText();
+        JsonNode inp = step.has("input") ? step.get("input") : MAPPER.createObjectNode();
+        JsonNode caps = step.has("captures") ? step.get("captures") : null;
+        JsonNode exp = step.has("expected") ? step.get("expected") : null;
+
+        switch (op) {
+            case "create_user" -> {
+                String dn = inp.has("display_name") && !inp.get("display_name").isNull()
+                        ? inp.get("display_name").asText() : null;
+                User user = dn != null ? store.createUser(dn) : store.createUser();
+                capture(caps, vars, "user.id", user.id());
+            }
+            case "create_user_with_password_credential" -> {
+                String identifier = inp.get("identifier").asText();
+                String password = inp.get("password").asText();
+                User user = store.createUser();
+                PasswordCredential cred = store.createPasswordCredential(
+                        user.id(), identifier, password);
+                capture(caps, vars, "user.id", user.id());
+                capture(caps, vars, "credential.id", cred.id());
+            }
+            case "suspend_user" ->
+                store.suspendUser(resolveVars(inp.get("usr_id").asText(), vars));
+            case "revoke_user" ->
+                store.revokeUser(resolveVars(inp.get("usr_id").asText(), vars));
+            case "revoke_credential" ->
+                store.revokeCredential(resolveVars(inp.get("cred_id").asText(), vars));
+            case "list_users" -> {
+                String cursor = inp.has("cursor")
+                        ? resolveVars(inp.get("cursor").asText(), vars) : null;
+                int limit = inp.has("limit") ? inp.get("limit").asInt() : 200;
+                String query = inp.has("query") ? inp.get("query").asText() : null;
+                Status status = inp.has("status") ? parseStatus(inp.get("status").asText()) : null;
+                Page<User> page = store.listUsers(cursor, limit, query, status);
+                capture(caps, vars, "page.next_cursor", page.nextCursor());
+                if (exp != null && exp.has("result")) {
+                    assertPageResult(page, exp.get("result"), vars);
+                }
+            }
+            case "update_user" -> {
+                String usrId = resolveVars(inp.get("usr_id").asText(), vars);
+                final String dn;
+                if (inp.has("display_name")) {
+                    dn = inp.get("display_name").isNull() ? null : inp.get("display_name").asText();
+                } else {
+                    dn = IdentityStore.UNSET;
+                }
+                if (exp != null && exp.has("error")) {
+                    Class<? extends RuntimeException> err =
+                            stepErrorClass(exp.get("error").asText());
+                    assertThrows(err, () -> store.updateUser(usrId, dn));
+                } else {
+                    store.updateUser(usrId, dn);
+                }
+            }
+            case "assert_user_fields" -> {
+                String usrId = resolveVars(inp.get("usr_id").asText(), vars);
+                User user = store.getUser(usrId);
+                if (inp.has("expected_display_name")) {
+                    if (inp.get("expected_display_name").isNull()) {
+                        assertNull(user.displayName());
+                    } else {
+                        assertEquals(inp.get("expected_display_name").asText(), user.displayName());
+                    }
+                }
+            }
+            default -> throw new IllegalArgumentException("Unknown step op: " + op);
+        }
+    }
+
+    private void assertPageResult(Page<User> page, JsonNode result, Map<String, String> vars) {
+        if (result.has("data_ids_in_order")) {
+            List<String> expected = new ArrayList<>();
+            result.get("data_ids_in_order").forEach(n -> expected.add(resolveVars(n.asText(), vars)));
+            List<String> actual = page.data().stream().map(User::id).toList();
+            assertEquals(expected, actual, "data_ids_in_order");
+        }
+        if (result.has("data_ids_unordered")) {
+            List<String> expected = new ArrayList<>();
+            result.get("data_ids_unordered").forEach(
+                    n -> expected.add(resolveVars(n.asText(), vars)));
+            List<String> actual = page.data().stream().map(User::id).toList();
+            assertEquals(
+                    new java.util.HashSet<>(expected),
+                    new java.util.HashSet<>(actual),
+                    "data_ids_unordered");
+        }
+        if (result.has("next_cursor")) {
+            if (result.get("next_cursor").isNull()) {
+                assertNull(page.nextCursor(), "next_cursor");
+            } else {
+                assertEquals(
+                        resolveVars(result.get("next_cursor").asText(), vars),
+                        page.nextCursor(), "next_cursor");
+            }
+        }
+        if (result.has("user_display_names")) {
+            java.util.Map<String, User> byId = new java.util.HashMap<>();
+            page.data().forEach(u -> byId.put(u.id(), u));
+            result.get("user_display_names").fields().forEachRemaining(e -> {
+                String uid = resolveVars(e.getKey(), vars);
+                User u = byId.get(uid);
+                assertNotNull(u, "user " + uid + " not in page");
+                if (e.getValue().isNull()) {
+                    assertNull(u.displayName(), "displayName for " + uid);
+                } else {
+                    assertEquals(e.getValue().asText(), u.displayName(), "displayName for " + uid);
+                }
+            });
+        }
+    }
+
+    private static void capture(
+            JsonNode caps, Map<String, String> vars, String path, String value
+    ) {
+        if (caps == null) return;
+        caps.fields().forEachRemaining(e -> {
+            if (path.equals(e.getValue().asText())) vars.put(e.getKey(), value);
+        });
+    }
+
+    private static String resolveVars(String s, Map<String, String> vars) {
+        if (s == null || !s.contains("{")) return s;
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < s.length()) {
+            int open = s.indexOf('{', i);
+            if (open < 0) { sb.append(s, i, s.length()); break; }
+            sb.append(s, i, open);
+            int close = s.indexOf('}', open + 1);
+            if (close < 0) { sb.append(s, open, s.length()); break; }
+            sb.append(vars.getOrDefault(s.substring(open + 1, close), s.substring(open, close + 1)));
+            i = close + 1;
+        }
+        return sb.toString();
+    }
+
+    private static Status parseStatus(String s) {
+        return switch (s) {
+            case "active"    -> Status.ACTIVE;
+            case "suspended" -> Status.SUSPENDED;
+            case "revoked"   -> Status.REVOKED;
+            default          -> null;
+        };
+    }
+
+    private static Class<? extends RuntimeException> stepErrorClass(String name) {
+        return switch (name) {
+            case "AlreadyTerminalError" -> AlreadyTerminalError.class;
+            case "NotFoundError"        -> NotFoundError.class;
+            default -> throw new IllegalArgumentException("Unknown step error: " + name);
+        };
     }
 }
