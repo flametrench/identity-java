@@ -1064,7 +1064,10 @@ public class PostgresIdentityStore implements IdentityStore {
                    + " WHERE type = 'password' AND identifier = ? AND status = 'active'")) {
             ps.setString(1, identifier);
             try (ResultSet rs = ps.executeQuery()) {
-                if (!rs.next()) throw new InvalidCredentialError("Invalid credential");
+                if (!rs.next()) {
+                    PasswordHashing.verify(AuthKind.PAT_DUMMY_PHC_HASH, password);
+                    throw new InvalidCredentialError("Invalid credential");
+                }
                 String hash = rs.getString("password_hash");
                 if (hash == null || !PasswordHashing.verify(hash, password)) {
                     throw new InvalidCredentialError("Invalid credential");

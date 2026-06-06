@@ -488,6 +488,7 @@ public class InMemoryIdentityStore implements IdentityStore {
         String credId = activeCredByIdentifier.get(
                 identifierKey(CredentialType.PASSWORD, identifier));
         if (credId == null) {
+            PasswordHashing.verify(AuthKind.PAT_DUMMY_PHC_HASH, password);
             throw new InvalidCredentialError();
         }
         Credential cred = requireCredential(credId);
