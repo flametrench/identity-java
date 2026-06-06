@@ -1964,9 +1964,9 @@ public class PostgresIdentityStore implements IdentityStore {
             PasswordHashing.verify(AuthKind.PAT_DUMMY_PHC_HASH, token != null ? token : "");
             throw new InvalidPatTokenError();
         }
-        int secondUnderscore = token.indexOf('_', 4);
-        String patWire = token.substring(0, secondUnderscore);
-        String secret = token.substring(secondUnderscore + 1);
+        // Positional parse per Go reference — safe even when secret contains '_'
+        String patWire = "pat_" + token.substring(4, 36);
+        String secret = token.substring(37);
 
         if (secret.length() > AuthKind.PAT_MAX_SECRET_LENGTH) {
             PasswordHashing.verify(AuthKind.PAT_DUMMY_PHC_HASH, "");
