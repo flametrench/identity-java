@@ -4,6 +4,7 @@
 package dev.flametrench.identity;
 
 import java.util.List;
+import java.time.Instant;
 
 /**
  * Contract every identity backend implements.
@@ -137,5 +138,23 @@ public interface IdentityStore {
     /** Returns null when no policy row exists. */
     UserMfaPolicy getMfaPolicy(String usrId);
 
-    UserMfaPolicy setMfaPolicy(String usrId, boolean required, java.time.Instant graceUntil);
+    UserMfaPolicy setMfaPolicy(String usrId, boolean required, Instant graceUntil);
+
+    // ─── Personal access tokens (v0.3, ADR 0016) ───
+
+    CreatePatResult createPat(CreatePatInput in);
+
+    PersonalAccessToken getPat(String patId);
+
+    Page<PersonalAccessToken> listPatsForUser(String usrId, ListPatsOptions opts);
+
+    /**
+     * Verify a PAT bearer token per ADR 0016 §"Verification semantics".
+     * Throws {@link InvalidPatTokenError} for structural failures and wrong secrets,
+     * {@link PatRevokedError} if revoked, {@link PatExpiredError} if past expires_at.
+     * Atomically updates last_used_at on success.
+     */
+    VerifiedPat verifyPatToken(String token);
+
+    PersonalAccessToken revokePat(String patId);
 }

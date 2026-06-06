@@ -637,6 +637,12 @@ public class PostgresIdentityStore implements IdentityStore {
                 ps.executeUpdate();
             }
             try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE pat SET revoked_at = ? WHERE usr_id = ? AND revoked_at IS NULL")) {
+                ps.setTimestamp(1, ts);
+                ps.setObject(2, uuid);
+                ps.executeUpdate();
+            }
+            try (PreparedStatement ps = conn.prepareStatement(
                     "UPDATE usr SET status = 'revoked' WHERE id = ?"
                   + " RETURNING id, status, display_name, created_at, updated_at")) {
                 ps.setObject(1, uuid);
@@ -1058,7 +1064,10 @@ public class PostgresIdentityStore implements IdentityStore {
                    + " WHERE type = 'password' AND identifier = ? AND status = 'active'")) {
             ps.setString(1, identifier);
             try (ResultSet rs = ps.executeQuery()) {
-                if (!rs.next()) throw new InvalidCredentialError("Invalid credential");
+                if (!rs.next()) {
+                    PasswordHashing.verify(AuthKind.PAT_DUMMY_PHC_HASH, password);
+                    throw new InvalidCredentialError("Invalid credential");
+                }
                 String hash = rs.getString("password_hash");
                 if (hash == null || !PasswordHashing.verify(hash, password)) {
                     throw new InvalidCredentialError("Invalid credential");
@@ -1820,6 +1829,228 @@ public class PostgresIdentityStore implements IdentityStore {
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
+    }
+
+    // ─── PATs (v0.3, ADR 0016) ───
+
+    private static PersonalAccessToken rowToPat(ResultSet rs, String usrId, String patId) throws SQLException {
+        String name = rs.getString("name");
+        Array scopeArr = rs.getArray("scope");
+        List<String> scope = scopeArr != null
+                ? List.of((String[]) scopeArr.getArray())
+                : List.of();
+        Timestamp expiresAt = rs.getTimestamp("expires_at");
+        Timestamp lastUsedAt = rs.getTimestamp("last_used_at");
+        Timestamp revokedAt = rs.getTimestamp("revoked_at");
+        Timestamp createdAt = rs.getTimestamp("created_at");
+        Timestamp updatedAt = rs.getTimestamp("updated_at");
+        PatStatus status;
+        if (revokedAt != null) {
+            status = PatStatus.REVOKED;
+        } else if (expiresAt != null && !Instant.now().isBefore(expiresAt.toInstant())) {
+            status = PatStatus.EXPIRED;
+        } else {
+            status = PatStatus.ACTIVE;
+        }
+        return new PersonalAccessToken(
+                patId, usrId, name, scope, status,
+                expiresAt != null ? expiresAt.toInstant() : null,
+                lastUsedAt != null ? lastUsedAt.toInstant() : null,
+                revokedAt != null ? revokedAt.toInstant() : null,
+                createdAt.toInstant(),
+                updatedAt.toInstant()
+        );
+    }
+
+    @Override
+    public CreatePatResult createPat(CreatePatInput in) {
+        String name = in.name();
+        if (name == null || name.codePointCount(0, name.length()) < 1
+                || name.codePointCount(0, name.length()) > 120) {
+            throw new PreconditionError("name must be 1-120 code units", "invalid_name");
+        }
+        if (in.expiresAt() != null) {
+            Instant max = now().plusSeconds(365L * 24 * 60 * 60);
+            if (in.expiresAt().isAfter(max)) {
+                throw new PreconditionError("expires_at exceeds 365-day cap", "expires_too_late");
+            }
+        }
+        UUID patUuid = UUID.randomUUID();
+        UUID usrUuid = wireToUuid(in.usrId());
+        String patWire = "pat_" + patUuid.toString().replace("-", "");
+        byte[] secretBytes = new byte[32];
+        SECURE_RANDOM.nextBytes(secretBytes);
+        String secret = Base64.getUrlEncoder().withoutPadding().encodeToString(secretBytes);
+        String hash = PasswordHashing.hash(secret);
+        String token = patWire + "_" + secret;
+        List<String> scope = in.scope() != null ? in.scope() : List.of();
+        return withConnection(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "INSERT INTO pat (id, usr_id, name, scope, secret_hash, expires_at)"
+                  + " VALUES (?, ?, ?, ?, ?, ?)"
+                  + " RETURNING name, scope, expires_at, last_used_at, revoked_at, created_at, updated_at")) {
+                ps.setObject(1, patUuid);
+                ps.setObject(2, usrUuid);
+                ps.setString(3, name);
+                ps.setArray(4, conn.createArrayOf("text", scope.toArray(new String[0])));
+                ps.setString(5, hash);
+                if (in.expiresAt() != null) {
+                    ps.setTimestamp(6, Timestamp.from(in.expiresAt()));
+                } else {
+                    ps.setNull(6, Types.TIMESTAMP_WITH_TIMEZONE);
+                }
+                try (ResultSet rs = ps.executeQuery()) {
+                    rs.next();
+                    PersonalAccessToken pat = rowToPat(rs, in.usrId(), patWire);
+                    return new CreatePatResult(pat, token);
+                }
+            }
+        });
+    }
+
+    @Override
+    public PersonalAccessToken getPat(String patId) {
+        UUID uuid = wireToUuid(patId);
+        return withConnection(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT id, usr_id, name, scope, expires_at, last_used_at, revoked_at, created_at, updated_at"
+                  + " FROM pat WHERE id = ?")) {
+                ps.setObject(1, uuid);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) throw new NotFoundError("PAT " + patId + " not found");
+                    String usrId = Id.encode("usr", rs.getString("usr_id"));
+                    return rowToPat(rs, usrId, patId);
+                }
+            }
+        });
+    }
+
+    @Override
+    public Page<PersonalAccessToken> listPatsForUser(String usrId, ListPatsOptions opts) {
+        UUID usrUuid = wireToUuid(usrId);
+        int limit = opts.limit() > 0 ? opts.limit() : 50;
+        return withConnection(conn -> {
+            StringBuilder sql = new StringBuilder(
+                    "SELECT id, usr_id, name, scope, expires_at, last_used_at, revoked_at, created_at, updated_at"
+                  + " FROM pat WHERE usr_id = ?");
+            List<Object> args = new ArrayList<>();
+            args.add(usrUuid);
+            if (opts.cursor() != null && !opts.cursor().isEmpty()) {
+                sql.append(" AND (created_at, id) > (SELECT created_at, id FROM pat WHERE id = ?)");
+                args.add(wireToUuid(opts.cursor()));
+            }
+            sql.append(" ORDER BY created_at ASC, id ASC LIMIT ?");
+            args.add(limit + 1);
+            try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
+                for (int i = 0; i < args.size(); i++) {
+                    ps.setObject(i + 1, args.get(i));
+                }
+                try (ResultSet rs = ps.executeQuery()) {
+                    List<PersonalAccessToken> rows = new ArrayList<>();
+                    while (rs.next()) {
+                        String wireId = "pat_" + rs.getString("id").replace("-", "");
+                        String rowUsrId = Id.encode("usr", rs.getString("usr_id"));
+                        rows.add(rowToPat(rs, rowUsrId, wireId));
+                    }
+                    boolean hasMore = rows.size() > limit;
+                    List<PersonalAccessToken> data = hasMore ? rows.subList(0, limit) : rows;
+                    String nextCursor = hasMore && !data.isEmpty() ? data.get(data.size() - 1).id() : null;
+                    return new Page<>(List.copyOf(data), nextCursor);
+                }
+            }
+        });
+    }
+
+    @Override
+    public VerifiedPat verifyPatToken(String token) {
+        if (!AuthKind.isStructurallyValidPatToken(token)) {
+            PasswordHashing.verify(AuthKind.PAT_DUMMY_PHC_HASH, token != null ? token : "");
+            throw new InvalidPatTokenError();
+        }
+        // Positional parse per Go reference — safe even when secret contains '_'
+        String patWire = "pat_" + token.substring(4, 36);
+        String secret = token.substring(37);
+
+        if (secret.length() > AuthKind.PAT_MAX_SECRET_LENGTH) {
+            PasswordHashing.verify(AuthKind.PAT_DUMMY_PHC_HASH, "");
+            throw new InvalidPatTokenError();
+        }
+
+        UUID patUuid;
+        try {
+            patUuid = wireToUuid(patWire);
+        } catch (Exception e) {
+            PasswordHashing.verify(AuthKind.PAT_DUMMY_PHC_HASH, secret);
+            throw new InvalidPatTokenError();
+        }
+
+        return withConnection(conn -> {
+            String usrId;
+            String hash;
+            Instant expiresAt;
+            Instant revokedAt;
+            List<String> scope;
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT usr_id, secret_hash, expires_at, revoked_at, scope FROM pat WHERE id = ?")) {
+                ps.setObject(1, patUuid);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        PasswordHashing.verify(AuthKind.PAT_DUMMY_PHC_HASH, secret);
+                        throw new InvalidPatTokenError();
+                    }
+                    usrId = Id.encode("usr", rs.getString("usr_id"));
+                    hash = rs.getString("secret_hash");
+                    Timestamp exp = rs.getTimestamp("expires_at");
+                    expiresAt = exp != null ? exp.toInstant() : null;
+                    Timestamp rev = rs.getTimestamp("revoked_at");
+                    revokedAt = rev != null ? rev.toInstant() : null;
+                    Array scopeArr = rs.getArray("scope");
+                    scope = scopeArr != null
+                            ? List.of((String[]) scopeArr.getArray())
+                            : List.of();
+                }
+            }
+            if (revokedAt != null) {
+                throw new PatRevokedError(patWire);
+            }
+            Instant now = now();
+            if (expiresAt != null && !now.isBefore(expiresAt)) {
+                throw new PatExpiredError(patWire);
+            }
+            if (!PasswordHashing.verify(hash, secret)) {
+                throw new InvalidPatTokenError();
+            }
+            // Best-effort last_used_at update.
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE pat SET last_used_at = ?, updated_at = ? WHERE id = ? AND revoked_at IS NULL")) {
+                ps.setTimestamp(1, Timestamp.from(now));
+                ps.setTimestamp(2, Timestamp.from(now));
+                ps.setObject(3, patUuid);
+                ps.executeUpdate();
+            }
+            return new VerifiedPat(patWire, usrId, scope);
+        });
+    }
+
+    @Override
+    public PersonalAccessToken revokePat(String patId) {
+        UUID uuid = wireToUuid(patId);
+        return withConnection(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE pat SET revoked_at = COALESCE(revoked_at, ?), updated_at = COALESCE(revoked_at, ?)"
+                  + " WHERE id = ?"
+                  + " RETURNING id, usr_id, name, scope, expires_at, last_used_at, revoked_at, created_at, updated_at")) {
+                Instant now = now();
+                ps.setTimestamp(1, Timestamp.from(now));
+                ps.setTimestamp(2, Timestamp.from(now));
+                ps.setObject(3, uuid);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) throw new NotFoundError("PAT " + patId + " not found");
+                    String usrId = Id.encode("usr", rs.getString("usr_id"));
+                    return rowToPat(rs, usrId, patId);
+                }
+            }
+        });
     }
 
     /** RFC 4648 base32 encoding (with padding). Inlined to mirror InMemoryIdentityStore. */
