@@ -337,6 +337,29 @@ CREATE INDEX inv_pending_idx  ON inv (identifier) WHERE status = 'pending';
 -- tup custom object types (e.g. 'project', 'doc'). The format pattern
 -- enforces the spec's prefix rules.
 
+-- ===========================================================================
+-- Personal access tokens (pat_) — ADR 0016 (v0.3)
+-- ===========================================================================
+
+CREATE TABLE IF NOT EXISTS pat (
+    id            UUID PRIMARY KEY,
+    usr_id        UUID NOT NULL REFERENCES usr(id),
+    name          TEXT NOT NULL,
+    scope         TEXT,
+    secret_hash   TEXT NOT NULL,
+    expires_at    TIMESTAMPTZ,
+    last_used_at  TIMESTAMPTZ,
+    revoked_at    TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS pat_usr_idx ON pat (usr_id);
+
+-- ===========================================================================
+-- Authorization tuples (tup_)
+-- ===========================================================================
+
 CREATE TABLE tup (
     id            UUID PRIMARY KEY,
     subject_type  TEXT NOT NULL
