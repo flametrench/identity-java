@@ -37,7 +37,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.fail;
 
 /**
- * State-machine conformance harness for the identity security-package
+ * State-machine conformance harness for the identity lifecycle and MFA
  * fixtures (user status gates, TOTP replay, recovery re-enrollment).
  *
  * <p>Each fixture runs against {@link InMemoryIdentityStore} and, when
@@ -46,7 +46,7 @@ import static org.junit.jupiter.api.Assertions.fail;
  * exception's class hierarchy, so a missing error class fails the vector
  * instead of breaking compilation.
  */
-class SecurityPackageConformanceTest {
+class StateMachineConformanceTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final Pattern VAR_PATTERN = Pattern.compile("^\\{([a-z_][a-z0-9_]*)\\}$");
@@ -104,7 +104,7 @@ class SecurityPackageConformanceTest {
 
     private static JsonNode loadFixture(String relativePath) throws IOException {
         String resource = "/conformance/fixtures/" + relativePath;
-        try (InputStream in = SecurityPackageConformanceTest.class.getResourceAsStream(resource)) {
+        try (InputStream in = StateMachineConformanceTest.class.getResourceAsStream(resource)) {
             if (in == null) throw new IOException("Fixture not found: " + resource);
             return MAPPER.readTree(in);
         }
