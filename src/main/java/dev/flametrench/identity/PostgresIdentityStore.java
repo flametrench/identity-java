@@ -1060,8 +1060,9 @@ public class PostgresIdentityStore implements IdentityStore {
     public VerifiedCredential verifyPassword(String identifier, String password) {
         try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
-                     "SELECT id, usr_id, password_hash FROM cred"
-                   + " WHERE type = 'password' AND identifier = ? AND status = 'active'")) {
+                     "SELECT c.id, c.usr_id, c.password_hash, u.status AS usr_status"
+                   + " FROM cred c JOIN usr u ON u.id = c.usr_id"
+                   + " WHERE c.type = 'password' AND c.identifier = ? AND c.status = 'active'")) {
             ps.setString(1, identifier);
             try (ResultSet rs = ps.executeQuery()) {
                 if (!rs.next()) {
@@ -1070,6 +1071,11 @@ public class PostgresIdentityStore implements IdentityStore {
                 }
                 String hash = rs.getString("password_hash");
                 if (hash == null || !PasswordHashing.verify(hash, password)) {
+                    throw new InvalidCredentialError("Invalid credential");
+                }
+                // A suspended user cannot authenticate. Checked after the
+                // hash so the response time doesn't reveal the user's status.
+                if (!"active".equals(rs.getString("usr_status"))) {
                     throw new InvalidCredentialError("Invalid credential");
                 }
                 String usrUuid = rs.getString("usr_id");
@@ -1419,46 +1425,77 @@ public class PostgresIdentityStore implements IdentityStore {
 
     @Override
     public RecoveryEnrollmentResult enrollRecoveryFactor(String usrId) {
-        try (Connection conn = acquireConnection()) {
-            UUID userUuid = requireUserActiveForMfa(conn, usrId);
-            Instant now = now();
-            String[] codes = RecoveryCodes.generateSet();
-            String[] hashes = new String[codes.length];
-            Boolean[] consumed = new Boolean[codes.length];
-            for (int i = 0; i < codes.length; i++) {
-                hashes[i] = PasswordHashing.hash(codes[i]);
-                consumed[i] = Boolean.FALSE;
-            }
-            UUID mfaUuid = UUID.fromString(Id.decode(Id.generate("mfa")).uuid());
-            Array hashArray = conn.createArrayOf("text", hashes);
-            Array consumedArray = conn.createArrayOf("boolean", consumed);
-            try (PreparedStatement ps = conn.prepareStatement(
-                    "INSERT INTO mfa (id, usr_id, type, status,"
-                  + " recovery_hashes, recovery_consumed, created_at, updated_at)"
-                  + " VALUES (?, ?, 'recovery', 'active', ?, ?, ?, ?)"
-                  + " RETURNING " + MFA_COLS)) {
-                ps.setObject(1, mfaUuid);
-                ps.setObject(2, userUuid);
-                ps.setArray(3, hashArray);
-                ps.setArray(4, consumedArray);
-                ps.setTimestamp(5, Timestamp.from(now));
-                ps.setTimestamp(6, Timestamp.from(now));
-                try (ResultSet rs = ps.executeQuery()) {
-                    rs.next();
-                    return new RecoveryEnrollmentResult(
-                            (RecoveryFactor) rowToFactor(rs),
-                            Arrays.asList(codes)
-                    );
-                }
-            }
-        } catch (SQLException e) {
-            if (isUniqueViolation(e)) {
+        try {
+            return tx(conn -> insertRecoveryFactor(conn, usrId));
+        } catch (RuntimeException e) {
+            if (e.getCause() instanceof SQLException s && isUniqueViolation(s)) {
                 throw new PreconditionError(
                         "User " + usrId + " already has an active recovery factor; revoke before re-enrolling",
                         "active_singleton_exists"
                 );
             }
-            throw new RuntimeException(e);
+            throw e;
+        }
+    }
+
+    private RecoveryEnrollmentResult insertRecoveryFactor(Connection conn, String usrId) throws SQLException {
+        UUID userUuid = requireUserActiveForMfa(conn, usrId);
+        // ADR 0008: once every code is consumed, re-enrollment revokes
+        // the exhausted set and the new one replaces it. A set with codes
+        // left still trips mfa_unique_active_singleton on the INSERT.
+        UUID replaces = null;
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT id, recovery_consumed FROM mfa"
+              + " WHERE usr_id = ? AND type = 'recovery' AND status = 'active' FOR UPDATE")) {
+            ps.setObject(1, userUuid);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    boolean exhausted = true;
+                    for (Object c : (Object[]) rs.getArray("recovery_consumed").getArray()) {
+                        if (!Boolean.TRUE.equals(c)) exhausted = false;
+                    }
+                    if (exhausted) replaces = (UUID) rs.getObject("id");
+                }
+            }
+        }
+        if (replaces != null) {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE mfa SET status = 'revoked', updated_at = ? WHERE id = ?")) {
+                ps.setTimestamp(1, Timestamp.from(now()));
+                ps.setObject(2, replaces);
+                ps.executeUpdate();
+            }
+        }
+        Instant now = now();
+        String[] codes = RecoveryCodes.generateSet();
+        String[] hashes = new String[codes.length];
+        Boolean[] consumed = new Boolean[codes.length];
+        for (int i = 0; i < codes.length; i++) {
+            hashes[i] = PasswordHashing.hash(codes[i]);
+            consumed[i] = Boolean.FALSE;
+        }
+        UUID mfaUuid = UUID.fromString(Id.decode(Id.generate("mfa")).uuid());
+        Array hashArray = conn.createArrayOf("text", hashes);
+        Array consumedArray = conn.createArrayOf("boolean", consumed);
+        try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT INTO mfa (id, usr_id, type, status, replaces,"
+              + " recovery_hashes, recovery_consumed, created_at, updated_at)"
+              + " VALUES (?, ?, 'recovery', 'active', ?, ?, ?, ?, ?)"
+              + " RETURNING " + MFA_COLS)) {
+            ps.setObject(1, mfaUuid);
+            ps.setObject(2, userUuid);
+            ps.setObject(3, replaces);
+            ps.setArray(4, hashArray);
+            ps.setArray(5, consumedArray);
+            ps.setTimestamp(6, Timestamp.from(now));
+            ps.setTimestamp(7, Timestamp.from(now));
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                return new RecoveryEnrollmentResult(
+                        (RecoveryFactor) rowToFactor(rs),
+                        Arrays.asList(codes)
+                );
+            }
         }
     }
 
@@ -1570,19 +1607,39 @@ public class PostgresIdentityStore implements IdentityStore {
                 );
             }
             checkPendingNotExpired(r);
-            if (!Totp.verify(r.totpSecret, code, now().getEpochSecond())) {
-                throw new InvalidCredentialError("TOTP code did not verify");
-            }
+            long step = matchTotpStep(r.totpSecret, code);
             try (PreparedStatement ps = conn.prepareStatement(
-                    "UPDATE mfa SET status = 'active', pending_expires_at = NULL"
-                  + " WHERE id = ? RETURNING " + MFA_COLS)) {
-                ps.setObject(1, r.id);
+                    "UPDATE mfa SET status = 'active', pending_expires_at = NULL,"
+                  + " totp_last_accepted_step = ?"
+                  + " WHERE id = ?" + TOTP_STEP_ADVANCES
+                  + " RETURNING " + MFA_COLS)) {
+                ps.setLong(1, step);
+                ps.setObject(2, r.id);
+                ps.setLong(3, step);
                 try (ResultSet rs = ps.executeQuery()) {
-                    rs.next();
+                    if (!rs.next()) throw new ReplayedTotpError();
                     return (TotpFactor) rowToFactor(rs);
                 }
             }
         });
+    }
+
+    /**
+     * ADR 0008 replay protection, design 3A: the UPDATE that accepts a TOTP
+     * code only matches while the code's step is later than the factor's
+     * last accepted step, so check and advance are one statement. Shared by
+     * confirmTotpFactor and verifyMfa.
+     */
+    private static final String TOTP_STEP_ADVANCES =
+            " AND (totp_last_accepted_step IS NULL OR totp_last_accepted_step < ?)";
+
+    private long matchTotpStep(byte[] secret, String code) {
+        long step = Totp.matchStep(secret, code, now().getEpochSecond(),
+                Totp.DEFAULT_PERIOD, Totp.DEFAULT_DIGITS, Totp.DEFAULT_ALGORITHM, 1);
+        if (step < 0) {
+            throw new InvalidCredentialError("TOTP code did not verify");
+        }
+        return step;
     }
 
     @Override
@@ -1656,12 +1713,18 @@ public class PostgresIdentityStore implements IdentityStore {
             ps.setObject(1, wireToUuid(usrId));
             try (ResultSet rs = ps.executeQuery()) {
                 if (!rs.next()) throw new InvalidCredentialError("No active TOTP factor for user");
-                byte[] secret = rs.getBytes("totp_secret");
-                if (!Totp.verify(secret, code, now().getEpochSecond())) {
-                    throw new InvalidCredentialError("TOTP code did not verify");
+                UUID mfaUuid = (UUID) rs.getObject("id");
+                long step = matchTotpStep(rs.getBytes("totp_secret"), code);
+                try (PreparedStatement up = conn.prepareStatement(
+                        "UPDATE mfa SET totp_last_accepted_step = ?"
+                      + " WHERE id = ? AND status = 'active'" + TOTP_STEP_ADVANCES)) {
+                    up.setLong(1, step);
+                    up.setObject(2, mfaUuid);
+                    up.setLong(3, step);
+                    if (up.executeUpdate() != 1) throw new ReplayedTotpError();
                 }
                 return new MfaVerifyResult(
-                        Id.encode("mfa", rs.getString("id")),
+                        Id.encode("mfa", mfaUuid.toString()),
                         FactorType.TOTP,
                         now(),
                         null
@@ -1884,7 +1947,19 @@ public class PostgresIdentityStore implements IdentityStore {
         String hash = PasswordHashing.hash(secret);
         String token = patWire + "_" + secret;
         List<String> scope = in.scope() != null ? in.scope() : List.of();
-        return withConnection(conn -> {
+        return tx(conn -> {
+            // FOR SHARE serializes with revokeUser (which locks the usr row
+            // FOR UPDATE before cascading to PATs), so a PAT can't be minted
+            // after its owner's revocation cascade has run.
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT status FROM usr WHERE id = ? FOR SHARE")) {
+                ps.setObject(1, usrUuid);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next() && "revoked".equals(rs.getString("status"))) {
+                        throw new PreconditionError("Cannot create PAT for revoked user", "user_revoked");
+                    }
+                }
+            }
             try (PreparedStatement ps = conn.prepareStatement(
                     "INSERT INTO pat (id, usr_id, name, scope, secret_hash, expires_at)"
                   + " VALUES (?, ?, ?, ?, ?, ?)"
@@ -1990,8 +2065,11 @@ public class PostgresIdentityStore implements IdentityStore {
             Instant expiresAt;
             Instant revokedAt;
             List<String> scope;
+            String ownerStatus;
             try (PreparedStatement ps = conn.prepareStatement(
-                    "SELECT usr_id, secret_hash, expires_at, revoked_at, scope FROM pat WHERE id = ?")) {
+                    "SELECT p.usr_id, p.secret_hash, p.expires_at, p.revoked_at, p.scope,"
+                  + " u.status AS usr_status"
+                  + " FROM pat p JOIN usr u ON u.id = p.usr_id WHERE p.id = ?")) {
                 ps.setObject(1, patUuid);
                 try (ResultSet rs = ps.executeQuery()) {
                     if (!rs.next()) {
@@ -2008,6 +2086,7 @@ public class PostgresIdentityStore implements IdentityStore {
                     scope = scopeArr != null
                             ? List.of((String[]) scopeArr.getArray())
                             : List.of();
+                    ownerStatus = rs.getString("usr_status");
                 }
             }
             if (revokedAt != null) {
@@ -2018,6 +2097,12 @@ public class PostgresIdentityStore implements IdentityStore {
                 throw new PatExpiredError(patWire);
             }
             if (!PasswordHashing.verify(hash, secret)) {
+                throw new InvalidPatTokenError();
+            }
+            // A PAT of a non-active owner doesn't authenticate. Evaluated at
+            // verify time so reinstating a suspended owner restores the token;
+            // the error is the generic one so the owner's status isn't disclosed.
+            if (!"active".equals(ownerStatus)) {
                 throw new InvalidPatTokenError();
             }
             // Best-effort last_used_at update.

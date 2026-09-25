@@ -15,4 +15,8 @@ public class InvalidCredentialError extends IdentityError {
     public InvalidCredentialError(String message) {
         super(message, "invalid_credential");
     }
+
+    protected InvalidCredentialError(String message, String code) {
+        super(message, code);
+    }
 }

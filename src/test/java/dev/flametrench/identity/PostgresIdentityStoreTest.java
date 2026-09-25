@@ -413,7 +413,10 @@ class PostgresIdentityStoreTest {
         String code = Totp.compute(secret, Instant.now().getEpochSecond());
         TotpFactor active = store.confirmTotpFactor(enroll.factor().id(), code);
         assertEquals(FactorStatus.ACTIVE, active.status());
-        MfaVerifyResult result = store.verifyMfa(u.id(), new TotpProof(code));
+        // The confirm code's step is consumed (replay protection); verify
+        // with the next step's code, which is inside the ±1 drift window.
+        String next = Totp.compute(secret, Instant.now().getEpochSecond() + Totp.DEFAULT_PERIOD);
+        MfaVerifyResult result = store.verifyMfa(u.id(), new TotpProof(next));
         assertEquals(FactorType.TOTP, result.type());
         assertEquals(active.id(), result.mfaId());
     }

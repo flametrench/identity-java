@@ -499,6 +499,12 @@ public class InMemoryIdentityStore implements IdentityStore {
         if (phc == null || !PasswordHashing.verify(phc, password)) {
             throw new InvalidCredentialError();
         }
+        // A suspended user cannot authenticate. Checked after the hash so
+        // the response time doesn't reveal the user's status.
+        User user = users.get(cred.usrId());
+        if (user == null || user.status() != Status.ACTIVE) {
+            throw new InvalidCredentialError();
+        }
         // ADR 0008: surface usr_mfa_policy state.
         UserMfaPolicy policy = mfaPolicies.get(cred.usrId());
         boolean mfaRequired = false;
@@ -665,6 +671,10 @@ public class InMemoryIdentityStore implements IdentityStore {
 
     private final java.util.Map<String, Factor> mfaFactors = new java.util.HashMap<>();
     private final java.util.Map<String, byte[]> mfaTotpSecrets = new java.util.HashMap<>();
+    /** mfaId → last accepted TOTP time-step (mfa.totp_last_accepted_step). */
+    private final java.util.Map<String, Long> mfaTotpLastAcceptedStep = new java.util.HashMap<>();
+    /** Guards the TOTP check-and-advance so one code can't be accepted twice. */
+    private final Object totpStepLock = new Object();
     private final java.util.Map<String, byte[]> mfaWebauthnKeys = new java.util.HashMap<>();
     private final java.util.Map<String, java.util.List<String>> mfaRecoveryHashes = new java.util.HashMap<>();
     private final java.util.Map<String, boolean[]> mfaRecoveryConsumed = new java.util.HashMap<>();
@@ -716,6 +726,15 @@ public class InMemoryIdentityStore implements IdentityStore {
     @Override
     public RecoveryEnrollmentResult enrollRecoveryFactor(String usrId) {
         checkUserActive(usrId);
+        // ADR 0008: once every code is consumed, re-enrollment revokes the
+        // exhausted set and the new one replaces it. A set with codes left
+        // is still refused by the singleton check below.
+        String replaces = null;
+        String existingId = mfaActiveSingleton.get(usrId + "|recovery");
+        if (existingId != null && allConsumed(mfaRecoveryConsumed.get(existingId))) {
+            revokeMfaFactor(existingId);
+            replaces = existingId;
+        }
         enforceNoActiveSingleton(usrId, "recovery");
         Instant now = now();
         String[] codes = RecoveryCodes.generateSet();
@@ -724,12 +743,20 @@ public class InMemoryIdentityStore implements IdentityStore {
         boolean[] consumed = new boolean[codes.length];
         String mfaId = Id.generate("mfa");
         RecoveryFactor factor = new RecoveryFactor(
-                mfaId, usrId, FactorStatus.ACTIVE, null, now, now, codes.length);
+                mfaId, usrId, FactorStatus.ACTIVE, replaces, now, now, codes.length);
         mfaFactors.put(mfaId, factor);
         mfaRecoveryHashes.put(mfaId, hashes);
         mfaRecoveryConsumed.put(mfaId, consumed);
         mfaActiveSingleton.put(usrId + "|recovery", mfaId);
         return new RecoveryEnrollmentResult(factor, java.util.List.of(codes));
+    }
+
+    private static boolean allConsumed(boolean[] consumed) {
+        if (consumed == null) return false;
+        for (boolean c : consumed) {
+            if (!c) return false;
+        }
+        return true;
     }
 
     @Override
@@ -758,11 +785,7 @@ public class InMemoryIdentityStore implements IdentityStore {
                     "factor_not_pending");
         }
         checkPendingNotExpired(totp);
-        byte[] secret = mfaTotpSecrets.get(mfaId);
-        if (!Totp.verify(secret, code, now().getEpochSecond(),
-                Totp.DEFAULT_PERIOD, Totp.DEFAULT_DIGITS, Totp.DEFAULT_ALGORITHM, 1)) {
-            throw new InvalidCredentialError("TOTP code did not verify");
-        }
+        acceptTotpStep(mfaId, code);
         Instant now = now();
         TotpFactor active = new TotpFactor(
                 totp.id(), totp.usrId(), totp.identifier(),
@@ -847,12 +870,30 @@ public class InMemoryIdentityStore implements IdentityStore {
         if (mfaId == null) {
             throw new InvalidCredentialError("No active TOTP factor for user");
         }
+        acceptTotpStep(mfaId, code);
+        return new MfaVerifyResult(mfaId, FactorType.TOTP, now(), null);
+    }
+
+    /**
+     * ADR 0008 replay protection, design 3A: a code is accepted only if the
+     * time-step it matches is later than the factor's last accepted step,
+     * and accepting it advances that step. Check and advance happen under
+     * one lock. Shared by confirmTotpFactor and verifyMfa.
+     */
+    private void acceptTotpStep(String mfaId, String code) {
         byte[] secret = mfaTotpSecrets.get(mfaId);
-        if (!Totp.verify(secret, code, now().getEpochSecond(),
-                Totp.DEFAULT_PERIOD, Totp.DEFAULT_DIGITS, Totp.DEFAULT_ALGORITHM, 1)) {
+        long step = Totp.matchStep(secret, code, now().getEpochSecond(),
+                Totp.DEFAULT_PERIOD, Totp.DEFAULT_DIGITS, Totp.DEFAULT_ALGORITHM, 1);
+        if (step < 0) {
             throw new InvalidCredentialError("TOTP code did not verify");
         }
-        return new MfaVerifyResult(mfaId, FactorType.TOTP, now(), null);
+        synchronized (totpStepLock) {
+            Long last = mfaTotpLastAcceptedStep.get(mfaId);
+            if (last != null && step <= last) {
+                throw new ReplayedTotpError();
+            }
+            mfaTotpLastAcceptedStep.put(mfaId, step);
+        }
     }
 
     private MfaVerifyResult verifyWebAuthnProof(String usrId, WebAuthnProof proof) {
@@ -984,8 +1025,12 @@ public class InMemoryIdentityStore implements IdentityStore {
 
     @Override
     public CreatePatResult createPat(CreatePatInput in) {
-        if (users.get(in.usrId()) == null) {
+        User owner = users.get(in.usrId());
+        if (owner == null) {
             throw new NotFoundError("User " + in.usrId() + " not found");
+        }
+        if (owner.status() == Status.REVOKED) {
+            throw new PreconditionError("Cannot create PAT for revoked user", "user_revoked");
         }
         String name = in.name();
         if (name == null || name.codePointCount(0, name.length()) < 1
@@ -1080,6 +1125,13 @@ public class InMemoryIdentityStore implements IdentityStore {
         }
         String hash = patSecretHashes.get(patId);
         if (!PasswordHashing.verify(hash, secret)) {
+            throw new InvalidPatTokenError();
+        }
+        // A PAT of a non-active owner doesn't authenticate. Evaluated at
+        // verify time so reinstating a suspended owner restores the token;
+        // the error is the generic one so the owner's status isn't disclosed.
+        User owner = users.get(pat.usrId());
+        if (owner == null || owner.status() != Status.ACTIVE) {
             throw new InvalidPatTokenError();
         }
 
