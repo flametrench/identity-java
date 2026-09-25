@@ -675,6 +675,8 @@ public class InMemoryIdentityStore implements IdentityStore {
     private final java.util.Map<String, Long> mfaTotpLastAcceptedStep = new java.util.HashMap<>();
     /** Guards the TOTP check-and-advance so one code can't be accepted twice. */
     private final Object totpStepLock = new Object();
+    /** Guards recovery re-enrollment so exactly one active set survives. */
+    private final Object recoveryEnrollLock = new Object();
     private final java.util.Map<String, byte[]> mfaWebauthnKeys = new java.util.HashMap<>();
     private final java.util.Map<String, java.util.List<String>> mfaRecoveryHashes = new java.util.HashMap<>();
     private final java.util.Map<String, boolean[]> mfaRecoveryConsumed = new java.util.HashMap<>();
@@ -725,6 +727,12 @@ public class InMemoryIdentityStore implements IdentityStore {
 
     @Override
     public RecoveryEnrollmentResult enrollRecoveryFactor(String usrId) {
+        synchronized (recoveryEnrollLock) {
+            return enrollRecoveryFactorLocked(usrId);
+        }
+    }
+
+    private RecoveryEnrollmentResult enrollRecoveryFactorLocked(String usrId) {
         checkUserActive(usrId);
         // ADR 0008: once every code is consumed, re-enrollment revokes the
         // exhausted set and the new one replaces it. A set with codes left
