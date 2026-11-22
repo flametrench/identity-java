@@ -1981,11 +1981,9 @@ public class PostgresIdentityStore implements IdentityStore {
                 ps.setObject(1, usrUuid);
                 try (ResultSet rs = ps.executeQuery()) {
                     String ownerStatus = rs.next() ? rs.getString("status") : null;
-                    if ("revoked".equals(ownerStatus)) {
-                        throw new PreconditionError("Cannot create PAT for revoked user", "user_revoked");
-                    }
-                    if ("suspended".equals(ownerStatus)) {
-                        throw new PreconditionError("Cannot create PAT for suspended user", "user_suspended");
+                    if (ownerStatus != null && !"active".equals(ownerStatus)) {
+                        throw new PreconditionError(
+                                "Cannot create PAT for " + ownerStatus + " user", "user_not_active");
                     }
                 }
             }

@@ -1056,11 +1056,9 @@ public class InMemoryIdentityStore implements IdentityStore {
         if (owner == null) {
             throw new NotFoundError("User " + in.usrId() + " not found");
         }
-        if (owner.status() == Status.REVOKED) {
-            throw new PreconditionError("Cannot create PAT for revoked user", "user_revoked");
-        }
-        if (owner.status() == Status.SUSPENDED) {
-            throw new PreconditionError("Cannot create PAT for suspended user", "user_suspended");
+        if (owner.status() != Status.ACTIVE) {
+            throw new PreconditionError(
+                    "Cannot create PAT for " + owner.status().getValue() + " user", "user_not_active");
         }
         String name = in.name();
         if (name == null || name.codePointCount(0, name.length()) < 1

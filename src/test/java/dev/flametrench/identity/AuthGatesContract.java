@@ -205,7 +205,7 @@ abstract class AuthGatesContract {
         String usrId = store.createUser().id();
         store.revokeUser(usrId);
         PreconditionError err = assertThrows(PreconditionError.class, () -> pat(usrId));
-        assertEquals("user_revoked", err.getReason());
+        assertEquals("user_not_active", err.getReason());
         assertTrue(store.listPatsForUser(usrId, new ListPatsOptions(null, 50)).data().isEmpty());
     }
 
@@ -214,7 +214,7 @@ abstract class AuthGatesContract {
         String usrId = store.createUser().id();
         store.suspendUser(usrId);
         PreconditionError err = assertThrows(PreconditionError.class, () -> pat(usrId));
-        assertEquals("user_suspended", err.getReason());
+        assertEquals("user_not_active", err.getReason());
         assertTrue(store.listPatsForUser(usrId, new ListPatsOptions(null, 50)).data().isEmpty());
     }
 
