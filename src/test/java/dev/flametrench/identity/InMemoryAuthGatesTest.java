@@ -5,7 +5,7 @@ package dev.flametrench.identity;
 
 import java.time.Clock;
 
-class InMemorySecurityGatesTest extends SecurityGatesContract {
+class InMemoryAuthGatesTest extends AuthGatesContract {
     @Override
     protected IdentityStore newStore(Clock clock) {
         return new InMemoryIdentityStore(clock);

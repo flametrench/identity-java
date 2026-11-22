@@ -38,12 +38,12 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * State-machine conformance harness for the identity lifecycle and MFA
- * fixtures (user status gates, TOTP replay, recovery re-enrollment).
+ * fixtures (user status gates, TOTP replay).
  *
  * <p>Each fixture runs against {@link InMemoryIdentityStore} and, when
  * {@code IDENTITY_POSTGRES_URL} is set, against {@link PostgresIdentityStore}.
  * Expected errors are matched by spec error name against the thrown
- * exception's class hierarchy, so a missing error class fails the vector
+ * exception's class name, so a missing error class fails the vector
  * instead of breaking compilation.
  */
 class StateMachineConformanceTest {
@@ -55,7 +55,6 @@ class StateMachineConformanceTest {
     private static final String[] FIXTURES = {
             "identity/user-status-gates.json",
             "identity/mfa/totp-replay-rejected.json",
-            "identity/mfa/recovery-single-active-set.json",
     };
 
     /** A clock the {@code set_clock} pseudo-op can pin. */
@@ -148,11 +147,10 @@ class StateMachineConformanceTest {
         return cur;
     }
 
+    // ADR 0027 §7: exact type match, so a vector expecting InvalidCredentialError
+    // does not pass on its ReplayedTotpError subtype.
     private static boolean isNamed(Throwable t, String errorName) {
-        for (Class<?> c = t.getClass(); c != null; c = c.getSuperclass()) {
-            if (c.getSimpleName().equals(errorName)) return true;
-        }
-        return false;
+        return t.getClass().getSimpleName().equals(errorName);
     }
 
     private static byte[] base32Decode(String s) {

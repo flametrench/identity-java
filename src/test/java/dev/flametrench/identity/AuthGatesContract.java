@@ -27,7 +27,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * Each refusal also asserts that the refused call changed nothing.
  * Subclassed once per store.
  */
-abstract class SecurityGatesContract {
+abstract class AuthGatesContract {
 
     private static final String PASSWORD = "long-enough-password-for-floor";
 
@@ -88,7 +88,10 @@ abstract class SecurityGatesContract {
         Enrolled e = enrolledTotp();
         String c = code(e.secret());
         store.verifyMfa(e.usrId(), new TotpProof(c));
-        assertThrows(ReplayedTotpError.class, () -> store.verifyMfa(e.usrId(), new TotpProof(c)));
+        ReplayedTotpError err = assertThrows(ReplayedTotpError.class,
+                () -> store.verifyMfa(e.usrId(), new TotpProof(c)));
+        assertEquals("unauthorized.totp_replayed", err.getCode());
+        assertInstanceOf(InvalidCredentialError.class, err);
 
         // The refusal changed nothing: the next step's code is accepted.
         setClock("2026-01-01T00:01:30Z");
@@ -222,5 +225,24 @@ abstract class SecurityGatesContract {
         assertEquals(1, active.size());
         assertEquals(first.factor().id(), active.get(0).id());
         store.verifyMfa(usrId, new RecoveryProof(first.codes().get(1)));
+    }
+
+    @Test
+    void recovery_reEnrollAfterExhaustion_replacesSet() {
+        String usrId = store.createUser().id();
+        RecoveryEnrollmentResult first = store.enrollRecoveryFactor(usrId);
+        for (String code : first.codes()) {
+            store.verifyMfa(usrId, new RecoveryProof(code));
+        }
+
+        RecoveryEnrollmentResult second = store.enrollRecoveryFactor(usrId);
+
+        List<Factor> active = store.listMfaFactors(usrId).stream()
+                .filter(f -> f.type() == FactorType.RECOVERY && f.status() == FactorStatus.ACTIVE)
+                .toList();
+        assertEquals(List.of(second.factor().id()), active.stream().map(Factor::id).toList());
+        assertEquals(FactorStatus.REVOKED, store.getMfaFactor(first.factor().id()).status());
+        assertEquals(first.factor().id(), store.getMfaFactor(second.factor().id()).replaces());
+        store.verifyMfa(usrId, new RecoveryProof(second.codes().get(0)));
     }
 }

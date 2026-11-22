@@ -14,7 +14,7 @@ import java.sql.Statement;
 import java.time.Clock;
 
 @EnabledIfEnvironmentVariable(named = "IDENTITY_POSTGRES_URL", matches = ".+")
-class PostgresSecurityGatesTest extends SecurityGatesContract {
+class PostgresAuthGatesTest extends AuthGatesContract {
     @Override
     protected IdentityStore newStore(Clock clock) {
         URI uri = URI.create(System.getenv("IDENTITY_POSTGRES_URL").replaceFirst("^postgresql:", "http:"));
