@@ -618,6 +618,12 @@ public class InMemoryIdentityStore implements IdentityStore {
         if (!constantTimeEquals(tokenHash, storedHash)) {
             throw new InvalidTokenError();
         }
+        // ADR 0029 backstop: a non-active user's session never verifies, even
+        // one the suspend/revoke cascade missed. Conflated with a bad token.
+        User owner = users.get(session.usrId());
+        if (owner == null || owner.status() != Status.ACTIVE) {
+            throw new InvalidTokenError();
+        }
         if (session.revokedAt() != null) {
             throw new SessionExpiredError("Session is revoked");
         }
@@ -630,6 +636,12 @@ public class InMemoryIdentityStore implements IdentityStore {
     @Override
     public SessionWithToken refreshSession(String sesId) {
         Session session = requireSession(sesId);
+        User owner = requireUser(session.usrId());
+        if (owner.status() != Status.ACTIVE) {
+            throw new PreconditionError(
+                    "Cannot refresh session for " + owner.status().getValue() + " user",
+                    "user_not_active");
+        }
         if (session.revokedAt() != null) {
             throw new SessionExpiredError("Session is already revoked");
         }

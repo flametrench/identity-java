@@ -179,6 +179,37 @@ abstract class AuthGatesContract {
         assertEquals(usrId, store.verifyPassword("sus@example.com", PASSWORD).usrId());
     }
 
+    // ─── Sessions ───
+
+    private SessionWithToken session(String usrId, String identifier) {
+        PasswordCredential cred = store.createPasswordCredential(usrId, identifier, PASSWORD);
+        return store.createSession(usrId, cred.id(), 3600);
+    }
+
+    @Test
+    void verifySessionToken_suspendedUser_refusedAsInvalidToken() {
+        String usrId = store.createUser().id();
+        SessionWithToken s = session(usrId, "ses-verify@example.com");
+        store.suspendUser(usrId);
+
+        InvalidTokenError err = assertThrows(InvalidTokenError.class,
+                () -> store.verifySessionToken(s.token()));
+        assertEquals(InvalidTokenError.class, err.getClass());
+    }
+
+    @Test
+    void refreshSession_suspendedUser_refused_andNoNewSession() {
+        String usrId = store.createUser().id();
+        SessionWithToken s = session(usrId, "ses-refresh@example.com");
+        store.suspendUser(usrId);
+
+        PreconditionError err = assertThrows(PreconditionError.class,
+                () -> store.refreshSession(s.session().id()));
+        assertEquals("user_not_active", err.getReason());
+        assertEquals(List.of(s.session().id()),
+                store.listSessionsForUser(usrId, null, 50).data().stream().map(Session::id).toList());
+    }
+
     // ─── PATs ───
 
     private CreatePatResult pat(String usrId) {

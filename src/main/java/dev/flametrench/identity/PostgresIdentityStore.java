@@ -1117,8 +1117,10 @@ public class PostgresIdentityStore implements IdentityStore {
         return tx(conn -> {
             UUID userUuid = wireToUuid(usrId);
             UUID credUuid = wireToUuid(credId);
+            // FOR SHARE serializes with suspendUser/revokeUser (usr FOR UPDATE,
+            // then the session cascade), so no session is minted after it.
             try (PreparedStatement ps = conn.prepareStatement(
-                    "SELECT status FROM usr WHERE id = ?")) {
+                    "SELECT status FROM usr WHERE id = ? FOR SHARE")) {
                 ps.setObject(1, userUuid);
                 try (ResultSet rs = ps.executeQuery()) {
                     if (!rs.next()) throw new NotFoundError("User " + usrId + " not found");
@@ -1215,14 +1217,20 @@ public class PostgresIdentityStore implements IdentityStore {
     @Override
     public Session verifySessionToken(String token) {
         byte[] tokenHash = hashTokenBytes(token);
+        // ADR 0029 backstop: read the owner's status with the session. No lock:
+        // verify writes nothing, and createSession's FOR SHARE closes the race.
         try (Connection conn = acquireConnection();
              PreparedStatement ps = conn.prepareStatement(
-                     "SELECT " + SES_COLS + " FROM ses WHERE token_hash = ?")) {
+                     "SELECT " + SES_COLS + ", (SELECT u.status FROM usr u WHERE u.id = ses.usr_id)"
+                   + " AS owner_status FROM ses WHERE token_hash = ?")) {
             ps.setBytes(1, tokenHash);
             try (ResultSet rs = ps.executeQuery()) {
                 if (!rs.next()) throw new InvalidTokenError("Invalid token");
                 byte[] stored = rs.getBytes("token_hash");
                 if (!constantTimeEquals(stored, tokenHash)) {
+                    throw new InvalidTokenError("Invalid token");
+                }
+                if (!"active".equals(rs.getString("owner_status"))) {
                     throw new InvalidTokenError("Invalid token");
                 }
                 Timestamp revokedAt = rs.getTimestamp("revoked_at");
@@ -1248,6 +1256,22 @@ public class PostgresIdentityStore implements IdentityStore {
             UUID credUuid;
             Instant createdAt;
             Instant expiresAt;
+            // Lock usr FOR SHARE before ses FOR UPDATE: the order suspendUser
+            // and revokeUser use, so no deadlock and no refresh across them.
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT u.status FROM ses s JOIN usr u ON u.id = s.usr_id"
+                  + " WHERE s.id = ? FOR SHARE OF u")) {
+                ps.setObject(1, uuid);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) throw new NotFoundError("Session " + sesId + " not found");
+                    String ownerStatus = rs.getString("status");
+                    if (!"active".equals(ownerStatus)) {
+                        throw new PreconditionError(
+                                "Cannot refresh session for " + ownerStatus + " user",
+                                "user_not_active");
+                    }
+                }
+            }
             try (PreparedStatement ps = conn.prepareStatement(
                     "SELECT usr_id, cred_id, created_at, expires_at, revoked_at"
                   + " FROM ses WHERE id = ? FOR UPDATE")) {
