@@ -1706,38 +1706,60 @@ public class PostgresIdentityStore implements IdentityStore {
     }
 
     private MfaVerifyResult verifyTotpProof(String usrId, String code) {
-        try (Connection conn = acquireConnection();
-             PreparedStatement ps = conn.prepareStatement(
-                     "SELECT id, totp_secret FROM mfa"
-                   + " WHERE usr_id = ? AND type = 'totp' AND status = 'active'")) {
-            ps.setObject(1, wireToUuid(usrId));
-            try (ResultSet rs = ps.executeQuery()) {
-                if (!rs.next()) throw new InvalidCredentialError("No active TOTP factor for user");
-                UUID mfaUuid = (UUID) rs.getObject("id");
-                long step = matchTotpStep(rs.getBytes("totp_secret"), code);
-                try (PreparedStatement up = conn.prepareStatement(
-                        "UPDATE mfa SET totp_last_accepted_step = ?"
-                      + " WHERE id = ? AND status = 'active'" + TOTP_STEP_ADVANCES)) {
-                    up.setLong(1, step);
-                    up.setObject(2, mfaUuid);
-                    up.setLong(3, step);
-                    if (up.executeUpdate() != 1) throw new ReplayedTotpError();
+        UUID userUuid = wireToUuid(usrId);
+        return tx(conn -> {
+            boolean userActive = lockUserStatusIsActive(conn, userUuid);
+            UUID mfaUuid;
+            long step;
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT id, totp_secret FROM mfa"
+                  + " WHERE usr_id = ? AND type = 'totp' AND status = 'active'")) {
+                ps.setObject(1, userUuid);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) throw new InvalidCredentialError("No active TOTP factor for user");
+                    mfaUuid = (UUID) rs.getObject("id");
+                    step = matchTotpStep(rs.getBytes("totp_secret"), code);
                 }
-                return new MfaVerifyResult(
-                        Id.encode("mfa", mfaUuid.toString()),
-                        FactorType.TOTP,
-                        now(),
-                        null
-                );
             }
-        } catch (SQLException e) {
-            throw new RuntimeException(e);
+            try (PreparedStatement up = conn.prepareStatement(
+                    "UPDATE mfa SET totp_last_accepted_step = ?"
+                  + " WHERE id = ? AND status = 'active'" + TOTP_STEP_ADVANCES)) {
+                up.setLong(1, step);
+                up.setObject(2, mfaUuid);
+                up.setLong(3, step);
+                if (up.executeUpdate() != 1) throw new ReplayedTotpError();
+            }
+            // Thrown after the step advanced, so tx() rolls the advance back.
+            if (!userActive) throw new InvalidCredentialError("TOTP code did not verify");
+            return new MfaVerifyResult(
+                    Id.encode("mfa", mfaUuid.toString()),
+                    FactorType.TOTP,
+                    now(),
+                    null
+            );
+        });
+    }
+
+    /**
+     * ADR 0029 gate for verifyMfa. Takes the usr row FOR SHARE first (the
+     * same lock order as suspendUser/revokeUser, so no deadlock) and holds
+     * it to commit; the caller refuses a non-active user only after the
+     * proof verifies, with the same error as a failed proof.
+     */
+    private static boolean lockUserStatusIsActive(Connection conn, UUID userUuid) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT status FROM usr WHERE id = ? FOR SHARE")) {
+            ps.setObject(1, userUuid);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() && "active".equals(rs.getString("status"));
+            }
         }
     }
 
     private MfaVerifyResult verifyWebAuthnProof(String usrId, WebAuthnProof proof) {
         return tx(conn -> {
             UUID userUuid = wireToUuid(usrId);
+            boolean userActive = lockUserStatusIsActive(conn, userUuid);
             UUID rowId;
             byte[] publicKey;
             long signCount;
@@ -1766,6 +1788,7 @@ public class PostgresIdentityStore implements IdentityStore {
                     proof.expectedChallenge(), proof.expectedOrigin(),
                     proof.authenticatorData(), proof.clientDataJson(), proof.signature()
             );
+            if (!userActive) throw new InvalidCredentialError("WebAuthn assertion did not verify");
             try (PreparedStatement ps = conn.prepareStatement(
                     "UPDATE mfa SET webauthn_sign_count = ? WHERE id = ?")) {
                 ps.setLong(1, result.newSignCount());
@@ -1787,6 +1810,7 @@ public class PostgresIdentityStore implements IdentityStore {
             throw new InvalidCredentialError("Recovery code is malformed");
         }
         return tx(conn -> {
+            boolean userActive = lockUserStatusIsActive(conn, wireToUuid(usrId));
             UUID rowId;
             String[] hashes;
             Boolean[] consumed;
@@ -1820,6 +1844,7 @@ public class PostgresIdentityStore implements IdentityStore {
             if (matched == -1) {
                 throw new InvalidCredentialError("Recovery code did not verify");
             }
+            if (!userActive) throw new InvalidCredentialError("Recovery code did not verify");
             consumed[matched] = Boolean.TRUE;
             Array updated = conn.createArrayOf("boolean", consumed);
             try (PreparedStatement ps = conn.prepareStatement(
@@ -1955,8 +1980,12 @@ public class PostgresIdentityStore implements IdentityStore {
                     "SELECT status FROM usr WHERE id = ? FOR SHARE")) {
                 ps.setObject(1, usrUuid);
                 try (ResultSet rs = ps.executeQuery()) {
-                    if (rs.next() && "revoked".equals(rs.getString("status"))) {
+                    String ownerStatus = rs.next() ? rs.getString("status") : null;
+                    if ("revoked".equals(ownerStatus)) {
                         throw new PreconditionError("Cannot create PAT for revoked user", "user_revoked");
+                    }
+                    if ("suspended".equals(ownerStatus)) {
+                        throw new PreconditionError("Cannot create PAT for suspended user", "user_suspended");
                     }
                 }
             }

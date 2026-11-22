@@ -209,6 +209,40 @@ abstract class AuthGatesContract {
         assertTrue(store.listPatsForUser(usrId, new ListPatsOptions(null, 50)).data().isEmpty());
     }
 
+    @Test
+    void createPat_suspendedUser_refused_andNoPatCreated() {
+        String usrId = store.createUser().id();
+        store.suspendUser(usrId);
+        PreconditionError err = assertThrows(PreconditionError.class, () -> pat(usrId));
+        assertEquals("user_suspended", err.getReason());
+        assertTrue(store.listPatsForUser(usrId, new ListPatsOptions(null, 50)).data().isEmpty());
+    }
+
+    @Test
+    void verifyMfa_suspendedUser_totpRefused_andStepNotConsumed() {
+        Enrolled e = enrolledTotp();
+        String c = code(e.secret());
+        store.suspendUser(e.usrId());
+        InvalidCredentialError err = assertThrows(InvalidCredentialError.class,
+                () -> store.verifyMfa(e.usrId(), new TotpProof(c)));
+        assertEquals(InvalidCredentialError.class, err.getClass());
+
+        store.reinstateUser(e.usrId());
+        store.verifyMfa(e.usrId(), new TotpProof(c));
+    }
+
+    @Test
+    void verifyMfa_suspendedUser_recoveryRefused_andCodeNotConsumed() {
+        String usrId = store.createUser().id();
+        RecoveryEnrollmentResult r = store.enrollRecoveryFactor(usrId);
+        store.suspendUser(usrId);
+        assertThrows(InvalidCredentialError.class,
+                () -> store.verifyMfa(usrId, new RecoveryProof(r.codes().get(0))));
+
+        store.reinstateUser(usrId);
+        store.verifyMfa(usrId, new RecoveryProof(r.codes().get(0)));
+    }
+
     // ─── Recovery re-enrollment ───
 
     @Test

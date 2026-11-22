@@ -793,7 +793,7 @@ public class InMemoryIdentityStore implements IdentityStore {
                     "factor_not_pending");
         }
         checkPendingNotExpired(totp);
-        acceptTotpStep(mfaId, code);
+        acceptTotpStep(mfaId, code, null);
         Instant now = now();
         TotpFactor active = new TotpFactor(
                 totp.id(), totp.usrId(), totp.identifier(),
@@ -878,17 +878,19 @@ public class InMemoryIdentityStore implements IdentityStore {
         if (mfaId == null) {
             throw new InvalidCredentialError("No active TOTP factor for user");
         }
-        acceptTotpStep(mfaId, code);
+        acceptTotpStep(mfaId, code, usrId);
         return new MfaVerifyResult(mfaId, FactorType.TOTP, now(), null);
     }
 
     /**
-     * ADR 0008 replay protection, design 3A: a code is accepted only if the
-     * time-step it matches is later than the factor's last accepted step,
-     * and accepting it advances that step. Check and advance happen under
-     * one lock. Shared by confirmTotpFactor and verifyMfa.
+     * ADR 0027 replay protection: a code is accepted only if the time-step
+     * it matches is later than the factor's last accepted step, and
+     * accepting it advances that step. Check and advance happen under one
+     * lock. Shared by confirmTotpFactor ({@code gateUsrId} null) and
+     * verifyMfa, which also applies the ADR 0029 user-status gate before
+     * the step advances.
      */
-    private void acceptTotpStep(String mfaId, String code) {
+    private void acceptTotpStep(String mfaId, String code, String gateUsrId) {
         byte[] secret = mfaTotpSecrets.get(mfaId);
         long step = Totp.matchStep(secret, code, now().getEpochSecond(),
                 Totp.DEFAULT_PERIOD, Totp.DEFAULT_DIGITS, Totp.DEFAULT_ALGORITHM, 1);
@@ -900,7 +902,22 @@ public class InMemoryIdentityStore implements IdentityStore {
             if (last != null && step <= last) {
                 throw new ReplayedTotpError();
             }
+            if (gateUsrId != null) {
+                refuseInactiveUserForMfa(gateUsrId, "TOTP code did not verify");
+            }
             mfaTotpLastAcceptedStep.put(mfaId, step);
+        }
+    }
+
+    /**
+     * ADR 0029: verifyMfa refuses a non-active user with the same error as
+     * a failed proof, so the refusal is no status oracle. Callers run it
+     * after the proof verifies and before anything is consumed.
+     */
+    private void refuseInactiveUserForMfa(String usrId, String failureMessage) {
+        User user = users.get(usrId);
+        if (user == null || user.status() != Status.ACTIVE) {
+            throw new InvalidCredentialError(failureMessage);
         }
     }
 
@@ -924,6 +941,7 @@ public class InMemoryIdentityStore implements IdentityStore {
                 wa.signCount(), wa.rpId(),
                 proof.expectedChallenge(), proof.expectedOrigin(),
                 proof.authenticatorData(), proof.clientDataJson(), proof.signature());
+        refuseInactiveUserForMfa(usrId, "WebAuthn assertion did not verify");
         Instant now = now();
         mfaFactors.put(mfaId, new WebAuthnFactor(
                 wa.id(), wa.usrId(), wa.identifier(),
@@ -957,6 +975,7 @@ public class InMemoryIdentityStore implements IdentityStore {
         if (matchedSlot == -1) {
             throw new InvalidCredentialError("Recovery code did not verify");
         }
+        refuseInactiveUserForMfa(usrId, "Recovery code did not verify");
         consumed[matchedSlot] = true;
         Factor f = mfaFactors.get(mfaId);
         if (f instanceof RecoveryFactor r) {
@@ -1039,6 +1058,9 @@ public class InMemoryIdentityStore implements IdentityStore {
         }
         if (owner.status() == Status.REVOKED) {
             throw new PreconditionError("Cannot create PAT for revoked user", "user_revoked");
+        }
+        if (owner.status() == Status.SUSPENDED) {
+            throw new PreconditionError("Cannot create PAT for suspended user", "user_suspended");
         }
         String name = in.name();
         if (name == null || name.codePointCount(0, name.length()) < 1
