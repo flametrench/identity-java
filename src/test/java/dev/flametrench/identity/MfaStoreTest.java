@@ -178,6 +178,9 @@ class MfaStoreTest {
         byte[] secret = decodeBase32(enroll.secretB32());
         store.confirmTotpFactor(enroll.factor().id(),
                 Totp.compute(secret, mockTime.get().getEpochSecond()));
+        // The confirm code's step is consumed (replay protection); verify
+        // with the next step's code.
+        advance(Totp.DEFAULT_PERIOD);
         MfaVerifyResult result = store.verifyMfa(user.id(),
                 new TotpProof(Totp.compute(secret, mockTime.get().getEpochSecond())));
         assertEquals(FactorType.TOTP, result.type());

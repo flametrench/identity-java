@@ -85,6 +85,26 @@ public final class Totp {
             String algorithm,
             int driftWindows
     ) {
+        return matchStep(secret, candidate, timestamp, period, digits, algorithm, driftWindows) >= 0;
+    }
+
+    /**
+     * Like {@link #verify(byte[], String, long, int, int, String, int)} but
+     * returns the time-step counter ({@code floor(unix_time / period)}) the
+     * candidate matched, or {@code -1} if it matched none. Stores use the
+     * counter for replay protection (ADR 0008). Every window is computed
+     * so work doesn't depend on which one matched; if the candidate
+     * matches more than one window, the latest step wins.
+     */
+    public static long matchStep(
+            byte[] secret,
+            String candidate,
+            long timestamp,
+            int period,
+            int digits,
+            String algorithm,
+            int driftWindows
+    ) {
         if (driftWindows < 0 || driftWindows > 10) {
             // Cap the verifier search radius. Each window adds one HMAC
             // computation, so unbounded values amount to a CPU-exhaustion
@@ -94,11 +114,12 @@ public final class Totp {
                     "driftWindows must be 0..10, got " + driftWindows
             );
         }
-        if (candidate == null || candidate.length() != digits) return false;
+        if (candidate == null || candidate.length() != digits) return -1;
         for (int i = 0; i < candidate.length(); i++) {
             char c = candidate.charAt(i);
-            if (c < '0' || c > '9') return false;
+            if (c < '0' || c > '9') return -1;
         }
+        long matched = -1;
         for (int w = -driftWindows; w <= driftWindows; w++) {
             long ts = timestamp + ((long) w * period);
             String expected = compute(secret, ts, period, digits, algorithm);
@@ -106,10 +127,10 @@ public final class Totp {
                     expected.getBytes(StandardCharsets.US_ASCII),
                     candidate.getBytes(StandardCharsets.US_ASCII)
             )) {
-                return true;
+                matched = Math.floorDiv(ts, period);
             }
         }
-        return false;
+        return matched;
     }
 
     /** Generate a fresh TOTP shared secret. Default 20 bytes per RFC 6238. */
